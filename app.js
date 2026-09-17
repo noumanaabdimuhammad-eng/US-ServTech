@@ -52,6 +52,7 @@ const state = {
   bankBalances: [],
   tasksByParent: {},   // parent_id -> [task,...]
   expanded: {},        // "table:id" -> true
+  inquiryDraft: null,  // the in-progress "New inquiry" form — see freshInquiryDraft()
   dashboardKpis: null,
   loading: true,
   authBusy: false,
@@ -323,37 +324,47 @@ App.toggle = function (table, id) {
 // ------------------------------------------------------------ customers
 //
 // Customers has no standalone "add" form — it's a read-only directory. New
-// customers enter the system the moment they're named on a new Inquiry (or,
-// if a work order is opened for someone without going through an inquiry
-// first, on that Work Order) — see resolveCustomer() below, which creates
-// the customers row right then rather than leaving an orphaned free-text
-// name on the inquiry/order.
+// customers enter the system the moment they're named on a new Inquiry (the
+// only place a customer gets picked or created now that Work Orders can no
+// longer be created directly — see resolveCustomerFromDraft below, which
+// creates the customers row right then rather than leaving an orphaned
+// free-text name on the inquiry.
 
-// Shared by every "who is this for" form (Inquiries, Work Orders): resolves
-// the chosen existing customer, or creates a brand-new customers row from
-// the typed name so it shows up in the Customers directory from then on. A
-// brand-new customer needs at least a Name, Invoice Name and Contact — VAT
-// and the address fields are added later from the Customers directory (see
-// App.updateCustomer / renderCustomerEditor below), since they're rarely
-// known the moment a new lead comes in. Returns the resolved {customer_id,
-// customer}, the string "invalid" if a new-customer attempt was missing a
-// required field (a toast has already been shown), or null if nothing was
-// picked or typed at all.
-async function resolveCustomer(v) {
-  if (v.customer_id) {
-    const c = state.customers.find((x) => x.id === v.customer_id);
+// Resolves the chosen existing customer, or creates a brand-new customers
+// row from the Inquiry draft's "new customer" fields (see freshInquiryDraft
+// below) so it shows up in the Customers directory from then on. A brand
+// new customer needs at least a Name, Invoice Name and Contact — the form
+// shows every other field (VAT, address) too, in case it's already known,
+// but doesn't require them; whatever's left blank can be filled in later
+// from the Customers directory (App.updateCustomer / renderCustomerEditor).
+// Returns the resolved {customer_id, customer}, the string "invalid" if a
+// new-customer attempt was missing a required field (a toast has already
+// been shown), or null if nothing was picked or typed at all.
+async function resolveCustomerFromDraft(d) {
+  if (d.customer_id) {
+    const c = state.customers.find((x) => x.id === d.customer_id);
     if (c) return { customer_id: c.id, customer: c.display_name };
   }
-  const name = (v.customer_name || "").trim();
-  const invoiceName = (v.customer_invoice_name || "").trim();
-  const contact = (v.customer_contact || "").trim();
-  if (!name && !invoiceName && !contact) return null;
+  const name = (d.customer_name || "").trim();
+  const invoiceName = (d.customer_invoice_name || "").trim();
+  const contact = (d.customer_contact || "").trim();
+  const anyOtherField = ["customer_vat_reg_no", "customer_building_no", "customer_street", "customer_district",
+    "customer_postal_code", "customer_city", "customer_state"].some((k) => (d[k] || "").trim());
+  if (!name && !invoiceName && !contact && !anyOtherField) return null;
   if (!name || !invoiceName || !contact) {
     showToast("A new customer needs a Name, Invoice Name and Contact", true);
     return "invalid";
   }
   const created = await guard(sb.from("customers").insert({
     display_name: name, invoice_name: invoiceName, contact,
+    vat_reg_no: (d.customer_vat_reg_no || "").trim() || null,
+    building_no: (d.customer_building_no || "").trim() || null,
+    street: (d.customer_street || "").trim() || null,
+    district: (d.customer_district || "").trim() || null,
+    postal_code: (d.customer_postal_code || "").trim() || null,
+    city: (d.customer_city || "").trim() || null,
+    state: (d.customer_state || "").trim() || null,
+    country: (d.customer_country || "").trim() || "Saudi Arabia",
   }).select().single());
   state.customers.unshift(created);
   return { customer_id: created.id, customer: created.display_name };
@@ -391,21 +402,100 @@ App.updateCustomer = async function (id, ev) {
 };
 
 // ------------------------------------------------------------- inquiries
+//
+// The whole point of an Inquiry is to capture what the customer needs in
+// one go — who they are and every service they're asking about — rather
+// than saving a bare header first and adding items on a second screen. So
+// "New inquiry" below is a single draft object (state.inquiryDraft) that
+// holds the customer fields AND a growable list of service line items;
+// nothing is written to the database until "Create inquiry" is submitted.
+// Every field is wired through App.setDraftField/setDraftItemField so that
+// a re-render (adding a row, picking an existing customer, a realtime
+// refresh landing mid-type) never loses what's already been typed — see
+// the comment on those functions for why that matters in this codebase.
+
+function freshInquiryDraft() {
+  return {
+    customer_id: "",
+    customer_name: "", customer_invoice_name: "", customer_contact: "",
+    customer_vat_reg_no: "", customer_building_no: "", customer_street: "", customer_district: "",
+    customer_postal_code: "", customer_city: "", customer_state: "", customer_country: "Saudi Arabia",
+    inquiry_date: new Date().toISOString().slice(0, 10),
+    contact_method: "", accounting_system: "",
+    discount: "0",
+    items: [{ service_type: "", description: "", price: "", discount: "0" }],
+  };
+}
+
+// Plain typing never triggers a full re-render (see above) — it just writes
+// the keystroke into the draft object, exactly like the DOM input already
+// shows it, then patches just the totals line directly (so the price/VAT/
+// total preview stays live without rebuilding — and de-focusing — the
+// input the officer is still typing in). A full re-render later (from an
+// unrelated event) rebuilds the same input from this value regardless, so
+// nothing is ever lost either way.
+function updateDraftTotalsDisplay() {
+  const d = state.inquiryDraft;
+  const el = document.getElementById("inquiryDraftTotals");
+  if (!d || !el) return;
+  const t = taskTotals(d.items, d.discount, d.accounting_system);
+  el.innerHTML = `Items subtotal (after item discounts): <b>${fmtMoney(t.subtotal)}</b> &nbsp; Order discount: <b>${fmtMoney(d.discount)}</b> &nbsp;
+        VAT (${t.rate > 0 ? "15%" : "—"}): <b>${fmtMoney(t.tax)}</b> &nbsp; Total: <b>${fmtMoney(t.total)}</b>`;
+}
+App.setDraftField = function (field, value) {
+  if (!state.inquiryDraft) return;
+  state.inquiryDraft[field] = value;
+  updateDraftTotalsDisplay();
+};
+App.setDraftItemField = function (idx, field, value) {
+  if (!state.inquiryDraft || !state.inquiryDraft.items[idx]) return;
+  state.inquiryDraft.items[idx][field] = value;
+  updateDraftTotalsDisplay();
+};
+App.addDraftItemRow = function () {
+  state.inquiryDraft.items.push({ service_type: "", description: "", price: "", discount: "0" });
+  render();
+};
+App.removeDraftItemRow = function (idx) {
+  state.inquiryDraft.items.splice(idx, 1);
+  if (!state.inquiryDraft.items.length) state.inquiryDraft.items.push({ service_type: "", description: "", price: "", discount: "0" });
+  render();
+};
+App.pickInquiryCustomer = function (id) {
+  state.inquiryDraft.customer_id = id;
+  render(); // re-render to show/clear that customer's info-on-file panel
+};
 
 App.addInquiry = async function (ev) {
   ev.preventDefault();
-  const v = fd(ev.target);
-  const who = await resolveCustomer(v);
+  const d = state.inquiryDraft;
+  const items = d.items.filter((it) => (it.description || "").trim() || Number(it.price || 0) > 0 || it.service_type);
+  if (!items.length) { showToast("Add at least one service line item", true); return false; }
+  for (const it of items) {
+    if (!it.service_type) { showToast("Pick a service — Calibration, Inspection or Card — for every line item", true); return false; }
+    if (!(it.description || "").trim()) { showToast("Every line item needs a description", true); return false; }
+  }
+  const who = await resolveCustomerFromDraft(d);
   if (who === "invalid") return false;
   if (!who) { showToast("Pick a customer or enter a new one's details", true); return false; }
-  await guard(sb.from("inquiries").insert({
+
+  const inquiry = await guard(sb.from("inquiries").insert({
     customer_id: who.customer_id, customer: who.customer,
-    inquiry_date: v.inquiry_date || new Date().toISOString().slice(0, 10),
-    contact_method: v.contact_method || null,
-    accounting_system: v.accounting_system || null,
-    discount: Number(v.discount || 0),
-  }), "Inquiry added");
-  ev.target.reset();
+    inquiry_date: d.inquiry_date || new Date().toISOString().slice(0, 10),
+    contact_method: d.contact_method || null,
+    accounting_system: d.accounting_system || null,
+    discount: Number(d.discount || 0),
+  }).select().single());
+
+  await guard(sb.from("tasks").insert(items.map((it) => ({
+    parent_type: "Inquiry", parent_id: inquiry.id,
+    service_type: it.service_type,
+    description: it.description.trim(),
+    price: Number(it.price || 0),
+    discount: Number(it.discount || 0),
+  }))), "Inquiry added");
+
+  state.inquiryDraft = freshInquiryDraft();
   await loadInquiries();
   render();
   return false;
@@ -435,24 +525,13 @@ App.rejectQuotation = async function (id) {
 };
 
 // ----------------------------------------------------------- work orders
+//
+// No standalone "new work order" form either — a work order only ever
+// comes from an Inquiry, either directly (App.convertInquiry(id,
+// 'workorder')) or via a Quotation being accepted (App.acceptQuotation
+// above). That's also what keeps a work order from ever appearing with no
+// line items and therefore nothing to set a status on.
 
-App.addWorkOrder = async function (ev) {
-  ev.preventDefault();
-  const v = fd(ev.target);
-  const who = await resolveCustomer(v);
-  if (who === "invalid") return false;
-  if (!who) { showToast("Pick a customer or enter a new one's details", true); return false; }
-  await guard(sb.from("work_orders").insert({
-    customer_id: who.customer_id, customer: who.customer,
-    wo_date: v.wo_date || new Date().toISOString().slice(0, 10),
-    accounting_system: v.accounting_system || "Odoo",
-    discount: Number(v.discount || 0),
-  }), "Work order created");
-  ev.target.reset();
-  await loadWorkOrders();
-  render();
-  return false;
-};
 App.cancelWorkOrder = async function (id) {
   const reason = prompt("Reason for cancelling this work order:");
   if (reason === null) return;
@@ -871,28 +950,105 @@ function renderTasksEditor(parentType, parentId, discount, accountingSystem, sho
 
 // ---------------------------------------------------------- Inquiries
 
+// Shown in the New Inquiry form once an existing customer is picked, so the
+// officer sees what's already on file instead of having to go check the
+// Customers directory separately.
+function renderCustomerInfoPanel(c) {
+  const addrLine1 = [c.building_no, c.street, c.district].filter(Boolean).join(", ");
+  const addrLine2 = [c.postal_code, c.city, c.state, c.country].filter(Boolean).join(", ");
+  return `
+  <div class="wo-detail" style="margin-top:10px">
+    <div class="form-row">
+      <div class="field"><label>Invoice name</label>${esc(c.invoice_name) || "<span class=\"subtle\">not on file</span>"}</div>
+      <div class="field"><label>Contact</label>${esc(c.contact) || "<span class=\"subtle\">not on file</span>"}</div>
+      <div class="field"><label>VAT registration no.</label>${esc(c.vat_reg_no) || "<span class=\"subtle\">not on file</span>"}</div>
+    </div>
+    <div class="form-row" style="margin-top:8px">
+      <div class="field" style="flex:2"><label>Address</label>${addrLine1 || addrLine2 ? `${esc(addrLine1)}${addrLine1 && addrLine2 ? "<br>" : ""}${esc(addrLine2)}` : `<span class="subtle">not on file</span>`}</div>
+    </div>
+    <div class="subtle" style="margin-top:6px">Anything missing gets filled in from the Customers directory — Edit on ${esc(c.display_name)}.</div>
+  </div>`;
+}
+
+// Shown instead of the panel above when there's no existing customer picked
+// — every field the business needs is here (see App.updateCustomer for the
+// same set), but only Name, Invoice Name and Contact are required; the rest
+// can come later from the Customers directory once it's known.
+function renderNewCustomerFields(d) {
+  return `
+  <div class="form-row" style="margin-top:10px">
+    <div class="field"><label>New customer — Name</label><input value="${esc(d.customer_name)}" oninput="App.setDraftField('customer_name',this.value)" placeholder="Required"></div>
+    <div class="field"><label>Invoice name</label><input value="${esc(d.customer_invoice_name)}" oninput="App.setDraftField('customer_invoice_name',this.value)" placeholder="Required"></div>
+    <div class="field"><label>Contact</label><input value="${esc(d.customer_contact)}" oninput="App.setDraftField('customer_contact',this.value)" placeholder="Required — phone or email"></div>
+    <div class="field"><label>VAT registration no.</label><input value="${esc(d.customer_vat_reg_no)}" oninput="App.setDraftField('customer_vat_reg_no',this.value)"></div>
+  </div>
+  <div class="form-row" style="margin-top:10px">
+    <div class="field"><label>Building no.</label><input value="${esc(d.customer_building_no)}" oninput="App.setDraftField('customer_building_no',this.value)"></div>
+    <div class="field"><label>Street</label><input value="${esc(d.customer_street)}" oninput="App.setDraftField('customer_street',this.value)"></div>
+    <div class="field"><label>District</label><input value="${esc(d.customer_district)}" oninput="App.setDraftField('customer_district',this.value)"></div>
+    <div class="field"><label>Postal code</label><input value="${esc(d.customer_postal_code)}" oninput="App.setDraftField('customer_postal_code',this.value)"></div>
+  </div>
+  <div class="form-row" style="margin-top:10px">
+    <div class="field"><label>City</label><input value="${esc(d.customer_city)}" oninput="App.setDraftField('customer_city',this.value)"></div>
+    <div class="field"><label>State / Province</label><input value="${esc(d.customer_state)}" oninput="App.setDraftField('customer_state',this.value)"></div>
+    <div class="field"><label>Country</label><input value="${esc(d.customer_country)}" oninput="App.setDraftField('customer_country',this.value)"></div>
+  </div>`;
+}
+
 function renderInquiries() {
+  if (!state.inquiryDraft) state.inquiryDraft = freshInquiryDraft();
+  const d = state.inquiryDraft;
+  const pickedCustomer = d.customer_id ? state.customers.find((c) => c.id === d.customer_id) : null;
+  const draftTotals = taskTotals(d.items, d.discount, d.accounting_system);
   return `
   <h2 class="page-title">Inquiries</h2>
-  <p class="page-sub">Capture a new lead, then open it below to price it with line items — pick Calibration, Inspection or Card for each, one customer can need several — before converting it to a quotation or straight to a work order.</p>
+  <p class="page-sub">Capture the customer and every service they're asking about in one go, then convert it to a quotation or straight to a work order.</p>
   <div class="card">
     <h3>New inquiry</h3>
     <form onsubmit="return App.addInquiry(event)">
       <div class="form-row">
-        <div class="field"><label>Customer</label><select name="customer_id">${customerOptions()}</select></div>
-        <div class="field"><label>Date</label><input type="date" name="inquiry_date" value="${new Date().toISOString().slice(0, 10)}"></div>
+        <div class="field"><label>Customer on file</label>
+          <select onchange="App.pickInquiryCustomer(this.value)">${customerOptions(d.customer_id)}</select>
+        </div>
+        <div class="field"><label>Date</label><input type="date" value="${esc(d.inquiry_date)}" oninput="App.setDraftField('inquiry_date',this.value)"></div>
+        <div class="field"><label>Contact method</label><input value="${esc(d.contact_method)}" oninput="App.setDraftField('contact_method',this.value)" placeholder="Phone / Email / Visit"></div>
+        <div class="field"><label>Accounting system</label>
+          <select onchange="App.setDraftField('accounting_system',this.value)">
+            <option value="" ${!d.accounting_system ? "selected" : ""}>—</option>
+            <option ${d.accounting_system === "Odoo" ? "selected" : ""}>Odoo</option>
+            <option ${d.accounting_system === "Zoho" ? "selected" : ""}>Zoho</option>
+          </select>
+        </div>
       </div>
-      <div class="form-row" style="margin-top:10px">
-        <div class="field"><label>…or new customer — Name</label><input name="customer_name" placeholder="Required if new"></div>
-        <div class="field"><label>Invoice name</label><input name="customer_invoice_name" placeholder="Name as it appears on the invoice"></div>
-        <div class="field"><label>Contact</label><input name="customer_contact" placeholder="Phone or email"></div>
+      ${pickedCustomer ? renderCustomerInfoPanel(pickedCustomer) : renderNewCustomerFields(d)}
+
+      <h4 style="margin-top:16px;margin-bottom:8px">Services required</h4>
+      <table>
+        <thead><tr><th>Service</th><th>Description</th><th class="right">Price (SAR)</th><th class="right">Discount (SAR)</th><th></th></tr></thead>
+        <tbody>
+          ${d.items.map((it, idx) => `
+          <tr>
+            <td>
+              <select onchange="App.setDraftItemField(${idx},'service_type',this.value)">
+                <option value="">— pick —</option>
+                ${SERVICE_TYPES.map((s) => `<option value="${s}" ${it.service_type === s ? "selected" : ""}>${s}</option>`).join("")}
+              </select>
+            </td>
+            <td><input value="${esc(it.description)}" oninput="App.setDraftItemField(${idx},'description',this.value)" placeholder="e.g. Torque wrench 0–200 Nm"></td>
+            <td class="right"><input type="number" step="0.01" min="0" style="width:110px" value="${esc(it.price)}" oninput="App.setDraftItemField(${idx},'price',this.value)"></td>
+            <td class="right"><input type="number" step="0.01" min="0" style="width:110px" value="${esc(it.discount)}" oninput="App.setDraftItemField(${idx},'discount',this.value)"></td>
+            <td>${d.items.length > 1 ? `<button type="button" class="link-btn" onclick="App.removeDraftItemRow(${idx})">remove</button>` : ""}</td>
+          </tr>`).join("")}
+        </tbody>
+      </table>
+      <button type="button" class="btn btn-ghost btn-sm" style="margin-top:8px" onclick="App.addDraftItemRow()">+ Add another service</button>
+
+      <div class="form-row" style="margin-top:14px">
+        <div class="field"><label>Overall discount on whole price (SAR)</label><input type="number" step="0.01" min="0" value="${esc(d.discount)}" oninput="App.setDraftField('discount',this.value)"></div>
+        <div class="field" style="flex:0"><label>&nbsp;</label><button class="btn btn-primary" type="submit">Create inquiry</button></div>
       </div>
-      <div class="form-row" style="margin-top:10px">
-        <div class="field"><label>Contact method</label><input name="contact_method" placeholder="Phone / Email / Visit"></div>
-        <div class="field"><label>Accounting system</label><select name="accounting_system"><option value="">—</option><option>Odoo</option><option>Zoho</option></select></div>
-        <div class="field"><label>Discount (SAR)</label><input name="discount" type="number" step="0.01" min="0" value="0"></div>
-        <div class="field" style="flex:0"><label>&nbsp;</label><button class="btn btn-primary" type="submit">Add inquiry</button></div>
-      </div>
+      <div class="totals-line" id="inquiryDraftTotals">Items subtotal (after item discounts): <b>${fmtMoney(draftTotals.subtotal)}</b> &nbsp; Order discount: <b>${fmtMoney(d.discount)}</b> &nbsp;
+        VAT (${draftTotals.rate > 0 ? "15%" : "—"}): <b>${fmtMoney(draftTotals.tax)}</b> &nbsp; Total: <b>${fmtMoney(draftTotals.total)}</b></div>
     </form>
   </div>
   <div class="card">
@@ -957,26 +1113,7 @@ function statusPillForQuote(s) {
 function renderWorkOrders() {
   return `
   <h2 class="page-title">Work Orders</h2>
-  <p class="page-sub">Mark each item Delivered as it's finished — once every item on an order is Delivered, its invoice and revenue posting happen by themselves. Once an item is Delivered, only an Owner or Manager can change or remove it.</p>
-  <div class="card">
-    <h3>New work order</h3>
-    <form onsubmit="return App.addWorkOrder(event)">
-      <div class="form-row">
-        <div class="field"><label>Customer</label><select name="customer_id">${customerOptions()}</select></div>
-        <div class="field"><label>Date</label><input type="date" name="wo_date" value="${new Date().toISOString().slice(0, 10)}"></div>
-        <div class="field"><label>Accounting system</label><select name="accounting_system"><option>Odoo</option><option>Zoho</option></select></div>
-      </div>
-      <div class="form-row" style="margin-top:10px">
-        <div class="field"><label>…or new customer — Name</label><input name="customer_name" placeholder="Required if new"></div>
-        <div class="field"><label>Invoice name</label><input name="customer_invoice_name" placeholder="Name as it appears on the invoice"></div>
-        <div class="field"><label>Contact</label><input name="customer_contact" placeholder="Phone or email"></div>
-      </div>
-      <div class="form-row" style="margin-top:10px">
-        <div class="field"><label>Discount (SAR)</label><input name="discount" type="number" step="0.01" min="0" value="0"></div>
-        <div class="field" style="flex:0"><label>&nbsp;</label><button class="btn btn-primary" type="submit">Add</button></div>
-      </div>
-    </form>
-  </div>
+  <p class="page-sub">Work orders come from Inquiries — convert one directly, or accept its Quotation. Mark each item Delivered as it's finished; once every item on an order is Delivered, its invoice and revenue posting happen by themselves. Once an item is Delivered, only an Owner or Manager can change or remove it.</p>
   <div class="card">
     <table>
       <thead><tr><th>No.</th><th>Customer</th><th>Date</th><th>Status</th><th>Invoice</th><th></th></tr></thead>
