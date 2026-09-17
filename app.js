@@ -9,10 +9,12 @@ const SUPABASE_URL = "https://xeefkivvlhsxepezypsb.supabase.co";
 const SUPABASE_KEY = "sb_publishable_KWvrmZGMETiKmEl1iGNw9A_pKLrUqhX";
 const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
-// VAT is not stored anywhere in the database — it is applied here, the same
-// way every screen in this app computes it, purely for display. 15% is
-// Saudi Arabia's standard VAT rate. Discount is a flat SAR amount taken off
-// the subtotal before VAT.
+// VAT is not stored anywhere in the database — it is applied here the same
+// way the database itself applies it when it posts revenue and payment
+// journal entries (see migrations 009 and 011): 15%, and only on orders
+// tagged "Odoo". Orders tagged "Zoho" carry no VAT. Discount is a flat SAR
+// amount taken off the subtotal before VAT. Keeping this formula identical
+// to the server's is what keeps the numbers shown here matching the ledger.
 const VAT_RATE = 0.15;
 
 const MGMT_ROLES = ["Owner", "Manager"];
@@ -24,6 +26,10 @@ const NAV = [
   { id: "quotations", label: "Quotations" },
   { id: "workorders", label: "Work Orders" },
   { id: "invoices", label: "Invoices" },
+  { id: "expenses", label: "Expenses", mgmtOnly: true },
+  { id: "employees", label: "Employees", mgmtOnly: true },
+  { id: "payroll", label: "Payroll", mgmtOnly: true },
+  { id: "fixedassets", label: "Fixed Assets", mgmtOnly: true },
   { id: "ledger", label: "Ledger", mgmtOnly: true },
 ];
 
@@ -37,6 +43,11 @@ const state = {
   workOrders: [],
   invoices: [],
   bankAccounts: [],
+  expenses: [],
+  employees: [],
+  payrollRuns: [],
+  payrollLinesByRun: {},
+  fixedAssets: [],
   accountBalances: [],
   bankBalances: [],
   tasksByParent: {},   // parent_id -> [task,...]
@@ -68,12 +79,13 @@ function fmtDateTime(d) {
   if (!d) return "—";
   return new Date(d).toLocaleString("en-GB", { day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit" });
 }
-function taskTotals(tasks, discount) {
+function taskTotals(tasks, discount, accountingSystem) {
   const subtotal = (tasks || []).reduce((s, t) => s + Number(t.price || 0), 0);
   const afterDiscount = Math.max(0, subtotal - Number(discount || 0));
-  const tax = afterDiscount * VAT_RATE;
+  const rate = accountingSystem === "Odoo" ? VAT_RATE : 0;
+  const tax = afterDiscount * rate;
   const total = afterDiscount + tax;
-  return { subtotal, afterDiscount, tax, total };
+  return { subtotal, afterDiscount, tax, total, rate };
 }
 function pill(text, cls) {
   return `<span class="pill pill-${cls}">${esc(text)}</span>`;
@@ -152,6 +164,30 @@ async function loadTasksFor(parentId) {
   const { data, error } = await sb.from("tasks").select("*").eq("parent_id", parentId).order("created_at");
   if (!error) state.tasksByParent[parentId] = data || [];
 }
+async function loadExpenses() {
+  if (!isMgmt()) return;
+  const { data, error } = await sb.from("expenses").select("*").order("created_at", { ascending: false }).limit(200);
+  if (!error) state.expenses = data || [];
+}
+async function loadEmployees() {
+  if (!isMgmt()) return;
+  const { data, error } = await sb.from("employees").select("*").order("created_at", { ascending: false });
+  if (!error) state.employees = data || [];
+}
+async function loadPayrollRuns() {
+  if (!isMgmt()) return;
+  const { data, error } = await sb.from("payroll_runs").select("*").order("created_at", { ascending: false }).limit(100);
+  if (!error) state.payrollRuns = data || [];
+}
+async function loadPayrollLines(runId) {
+  const { data, error } = await sb.from("payroll_lines").select("*").eq("payroll_run_id", runId).order("created_at");
+  if (!error) state.payrollLinesByRun[runId] = data || [];
+}
+async function loadFixedAssets() {
+  if (!isMgmt()) return;
+  const { data, error } = await sb.from("fixed_assets").select("*").order("created_at", { ascending: false }).limit(300);
+  if (!error) state.fixedAssets = data || [];
+}
 async function loadDashboardKpis() {
   const [openInq, pendingQ, inProcessWO, unpaidInv] = await Promise.all([
     sb.from("inquiries").select("id", { count: "exact", head: true }).is("quote_id", null).is("wo_id", null),
@@ -183,10 +219,17 @@ async function loadView(view) {
     if (view === "quotations") await Promise.all([loadQuotations(), state.customers.length ? null : loadCustomers()]);
     if (view === "workorders") await Promise.all([loadWorkOrders(), state.customers.length ? null : loadCustomers()]);
     if (view === "invoices") await Promise.all([loadInvoices(), loadBankAccounts()]);
+    if (view === "expenses") await Promise.all([loadExpenses(), loadBankAccounts()]);
+    if (view === "employees") await loadEmployees();
+    if (view === "payroll") await Promise.all([loadPayrollRuns(), loadEmployees(), loadBankAccounts()]);
+    if (view === "fixedassets") await Promise.all([loadFixedAssets(), loadBankAccounts()]);
     if (view === "ledger") await Promise.all([loadLedger(), loadBankAccounts()]);
-    // keep expanded rows' task lists fresh
-    const openParents = Object.keys(state.expanded).filter((k) => state.expanded[k]).map((k) => k.split(":")[1]);
-    await Promise.all(openParents.map(loadTasksFor));
+    // keep expanded rows' task lists (and payroll run lines) fresh
+    const openParents = Object.keys(state.expanded).filter((k) => state.expanded[k]);
+    await Promise.all(openParents.map((k) => {
+      const [table, id] = k.split(":");
+      return table === "payroll" ? loadPayrollLines(id) : loadTasksFor(id);
+    }));
   } finally {
     state.loading = false;
     render();
@@ -201,7 +244,8 @@ function scheduleRefresh() {
   refreshTimer = setTimeout(() => { loadView(state.view); }, 400);
 }
 function setupRealtime() {
-  const tables = ["customers", "inquiries", "quotations", "work_orders", "tasks", "invoices", "bank_accounts", "journal_entries"];
+  const tables = ["customers", "inquiries", "quotations", "work_orders", "tasks", "invoices", "bank_accounts",
+    "journal_entries", "expenses", "employees", "payroll_runs", "payroll_lines", "fixed_assets"];
   const channel = sb.channel("us-servtech-live");
   tables.forEach((t) => {
     channel.on("postgres_changes", { event: "*", schema: "public", table: t }, scheduleRefresh);
@@ -261,8 +305,12 @@ App.nav = function (view) {
 App.toggle = function (table, id) {
   const key = table + ":" + id;
   state.expanded[key] = !state.expanded[key];
-  if (state.expanded[key] && !state.tasksByParent[id]) {
-    loadTasksFor(id).then(render);
+  if (state.expanded[key]) {
+    if (table === "payroll") {
+      if (!state.payrollLinesByRun[id]) loadPayrollLines(id).then(render);
+    } else if (!state.tasksByParent[id]) {
+      loadTasksFor(id).then(render);
+    }
   }
   render();
 };
@@ -421,6 +469,133 @@ App.markInvoicePaid = async function (id, ev) {
   render();
 };
 
+// ---------------------------------------------------------------- expenses
+
+App.addExpense = async function (ev) {
+  ev.preventDefault();
+  const v = fd(ev.target);
+  if (!v.amount || Number(v.amount) <= 0) { showToast("Enter an amount", true); return false; }
+  await guard(sb.from("expenses").insert({
+    expense_date: v.expense_date || new Date().toISOString().slice(0, 10),
+    category: v.category || null, vendor: v.vendor || null,
+    cost_type: v.cost_type || "Overhead", amount: Number(v.amount),
+    description: v.description || null, requested_by: state.session.user.id,
+  }), "Expense added — pending approval");
+  ev.target.reset();
+  await loadExpenses();
+  render();
+  return false;
+};
+App.approveExpense = async function (id) {
+  await guard(sb.from("expenses").update({ status: "Approved", approved_by: state.session.user.id, approved_at: new Date().toISOString() }).eq("id", id), "Expense approved");
+  await loadExpenses();
+  render();
+};
+App.rejectExpense = async function (id) {
+  await guard(sb.from("expenses").update({ status: "Rejected", approved_by: state.session.user.id, approved_at: new Date().toISOString() }).eq("id", id), "Expense rejected");
+  await loadExpenses();
+  render();
+};
+App.payExpense = async function (id, ev) {
+  const bankId = ev.target.value;
+  if (!bankId) return;
+  await guard(sb.from("expenses").update({ payment_status: "Paid", paid_from: bankId, paid_at: new Date().toISOString() }).eq("id", id), "Expense paid");
+  await loadExpenses();
+  render();
+};
+
+// --------------------------------------------------------------- employees
+
+App.addEmployee = async function (ev) {
+  ev.preventDefault();
+  const v = fd(ev.target);
+  if (!v.name || !v.name.trim()) { showToast("Employee name is required", true); return false; }
+  await guard(sb.from("employees").insert({
+    name: v.name.trim(), role: v.role || null, monthly_salary: v.monthly_salary ? Number(v.monthly_salary) : null,
+  }), "Employee added");
+  ev.target.reset();
+  await loadEmployees();
+  render();
+  return false;
+};
+App.toggleEmployeeActive = async function (id, active) {
+  await guard(sb.from("employees").update({ active: !active }).eq("id", id));
+  await loadEmployees();
+  render();
+};
+
+// ----------------------------------------------------------------- payroll
+
+App.addPayrollRun = async function (ev) {
+  ev.preventDefault();
+  const v = fd(ev.target);
+  if (!v.period || !v.period.trim()) { showToast("Enter a pay period, e.g. 2026-09", true); return false; }
+  await guard(sb.from("payroll_runs").insert({ period: v.period.trim(), created_by: state.session.user.id }), "Payroll run created");
+  ev.target.reset();
+  await loadPayrollRuns();
+  render();
+  return false;
+};
+App.addPayrollLine = async function (runId, ev) {
+  ev.preventDefault();
+  const v = fd(ev.target);
+  const emp = state.employees.find((e) => e.id === v.employee_id);
+  if (!emp) { showToast("Pick an employee", true); return false; }
+  const gross = v.gross_salary ? Number(v.gross_salary) : Number(emp.monthly_salary || 0);
+  const net = v.net_pay ? Number(v.net_pay) : gross;
+  await guard(sb.from("payroll_lines").insert({
+    payroll_run_id: runId, employee_id: emp.id, employee_name: emp.name, gross_salary: gross, net_pay: net,
+  }));
+  ev.target.reset();
+  await loadPayrollLines(runId);
+  render();
+  return false;
+};
+App.deletePayrollLine = async function (id, runId) {
+  await guard(sb.from("payroll_lines").delete().eq("id", id));
+  await loadPayrollLines(runId);
+  render();
+};
+App.approvePayrollRun = async function (id) {
+  await guard(sb.from("payroll_runs").update({ status: "Approved", approved_by: state.session.user.id, approved_at: new Date().toISOString() }).eq("id", id), "Payroll run approved");
+  await loadPayrollRuns();
+  render();
+};
+App.payPayrollRun = async function (id, ev) {
+  const bankId = ev.target.value;
+  if (!bankId) return;
+  await guard(sb.from("payroll_runs").update({ status: "Paid", paid_from: bankId, paid_at: new Date().toISOString() }).eq("id", id), "Payroll paid");
+  await loadPayrollRuns();
+  render();
+};
+
+// ------------------------------------------------------------ fixed assets
+
+App.addFixedAsset = async function (ev) {
+  ev.preventDefault();
+  const v = fd(ev.target);
+  if (!v.name || !v.name.trim()) { showToast("Asset name is required", true); return false; }
+  if (!v.cost || Number(v.cost) <= 0) { showToast("Enter a cost", true); return false; }
+  if (!v.paid_from) { showToast("Pick which bank paid for it", true); return false; }
+  await guard(sb.from("fixed_assets").insert({
+    name: v.name.trim(), category: v.category || null, cost: Number(v.cost),
+    purchase_date: v.purchase_date || new Date().toISOString().slice(0, 10),
+    useful_life_months: v.useful_life_months ? Number(v.useful_life_months) : 36,
+    paid_from: v.paid_from,
+  }), "Asset recorded");
+  ev.target.reset();
+  await loadFixedAssets();
+  render();
+  return false;
+};
+App.runDepreciation = async function () {
+  const n = await guard(sb.rpc("run_monthly_depreciation"));
+  showToast(n > 0 ? `Depreciated ${n} asset${n === 1 ? "" : "s"} for this month` : "Nothing to depreciate this month — already up to date", false);
+  await loadFixedAssets();
+  await loadLedger();
+  render();
+};
+
 // ------------------------------------------------------------ bank accounts
 
 App.addBankAccount = async function (ev) {
@@ -499,9 +674,16 @@ function renderView() {
     case "quotations": return renderQuotations();
     case "workorders": return renderWorkOrders();
     case "invoices": return renderInvoices();
-    case "ledger": return isMgmt() ? renderLedger() : `<div class="empty-state">Not available for your role.</div>`;
+    case "expenses": return isMgmt() ? renderExpenses() : mgmtOnlyView();
+    case "employees": return isMgmt() ? renderEmployees() : mgmtOnlyView();
+    case "payroll": return isMgmt() ? renderPayroll() : mgmtOnlyView();
+    case "fixedassets": return isMgmt() ? renderFixedAssets() : mgmtOnlyView();
+    case "ledger": return isMgmt() ? renderLedger() : mgmtOnlyView();
     default: return "";
   }
+}
+function mgmtOnlyView() {
+  return `<div class="empty-state">Not available for your role.</div>`;
 }
 
 // ---------------------------------------------------------- Dashboard
@@ -575,9 +757,9 @@ function renderCustomers() {
 
 // ---------------------------------------------------------- Tasks editor
 
-function renderTasksEditor(parentType, parentId, discount, discountTable, showStatus) {
+function renderTasksEditor(parentType, parentId, discount, accountingSystem, showStatus) {
   const tasks = state.tasksByParent[parentId] || [];
-  const t = taskTotals(tasks, discount);
+  const t = taskTotals(tasks, discount, accountingSystem);
   return `
   <div class="wo-detail">
     <table>
@@ -603,7 +785,7 @@ function renderTasksEditor(parentType, parentId, discount, discountTable, showSt
     </form>
     <div class="totals-line">
       Subtotal: <b>${fmtMoney(t.subtotal)}</b> &nbsp; Discount: <b>${fmtMoney(discount)}</b> &nbsp;
-      VAT (15%): <b>${fmtMoney(t.tax)}</b> &nbsp; Total: <b>${fmtMoney(t.total)}</b>
+      VAT (${t.rate > 0 ? "15%" : "—"}): <b>${fmtMoney(t.tax)}</b> &nbsp; Total: <b>${fmtMoney(t.total)}</b>
       <span class="subtle">— computed here for display; not stored.</span>
     </div>
   </div>`;
@@ -649,7 +831,7 @@ function renderInquiries() {
               <button class="btn btn-ghost btn-sm" onclick="App.convertInquiry('${q.id}','workorder')">To work order</button>` : ""}
             </td>
           </tr>
-          ${open ? `<tr><td colspan="6">${renderTasksEditor("Inquiry", q.id, q.discount, null, false)}</td></tr>` : ""}`;
+          ${open ? `<tr><td colspan="6">${renderTasksEditor("Inquiry", q.id, q.discount, q.accounting_system, false)}</td></tr>` : ""}`;
         }).join("") : `<tr><td colspan="6" class="empty-state">No inquiries yet.</td></tr>`}
       </tbody>
     </table>
@@ -691,7 +873,7 @@ function renderQuotations() {
               <button class="btn btn-ghost btn-sm" onclick="App.rejectQuotation('${q.id}')">Reject</button>` : ""}
             </td>
           </tr>
-          ${open ? `<tr><td colspan="5">${renderTasksEditor("Quotation", q.id, q.discount, null, false)}</td></tr>` : ""}`;
+          ${open ? `<tr><td colspan="5">${renderTasksEditor("Quotation", q.id, q.discount, q.accounting_system, false)}</td></tr>` : ""}`;
         }).join("") : `<tr><td colspan="5" class="empty-state">No quotations yet.</td></tr>`}
       </tbody>
     </table>
@@ -735,7 +917,7 @@ function renderWorkOrders() {
             <td>${inv ? esc(inv.invoice_number) + " " + pill(inv.payment_status, inv.payment_status === "Paid" ? "paid" : "unpaid") : "—"}</td>
             <td onclick="event.stopPropagation()">${!w.cancelled ? `<button class="btn btn-ghost btn-sm" onclick="App.cancelWorkOrder('${w.id}')">Cancel</button>` : ""}</td>
           </tr>
-          ${open ? `<tr><td colspan="6">${renderTasksEditor("Work Order", w.id, w.discount, null, true)}</td></tr>` : ""}`;
+          ${open ? `<tr><td colspan="6">${renderTasksEditor("Work Order", w.id, w.discount, w.accounting_system, true)}</td></tr>` : ""}`;
         }).join("") : `<tr><td colspan="6" class="empty-state">No work orders yet.</td></tr>`}
       </tbody>
     </table>
@@ -755,7 +937,7 @@ function renderInvoices() {
         ${state.invoices.length ? state.invoices.map((inv) => {
           const wo = state.workOrders.find((w) => w.id === inv.wo_id);
           const tasks = wo ? (state.tasksByParent[wo.id] || null) : null;
-          const total = tasks ? taskTotals(tasks, wo.discount).total : null;
+          const total = tasks ? taskTotals(tasks, wo.discount, wo.accounting_system).total : null;
           return `
           <tr>
             <td>${esc(inv.invoice_number)}</td><td>${wo ? esc(wo.wo_number) : "—"}</td><td>${esc(inv.customer)}</td>
@@ -769,6 +951,200 @@ function renderInvoices() {
               </select>` : (inv.paid_from ? esc((state.bankAccounts.find((b) => b.id === inv.paid_from) || {}).name || "") : "")}</td>` : ""}
           </tr>`;
         }).join("") : `<tr><td colspan="${isMgmt() ? 7 : 6}" class="empty-state">No invoices yet.</td></tr>`}
+      </tbody>
+    </table>
+  </div>`;
+}
+
+// ---------------------------------------------------------- Expenses
+
+function expensePillCls(status) {
+  return { Pending: "pending", Approved: "accepted", Rejected: "rejected" }[status] || "pending";
+}
+function renderExpenses() {
+  return `
+  <h2 class="page-title">Expenses</h2>
+  <p class="page-sub">Every expense needs approving, then paying — paying it is what posts it to the ledger and deducts it from the bank.</p>
+  <div class="card">
+    <h3>New expense</h3>
+    <form onsubmit="return App.addExpense(event)">
+      <div class="form-row">
+        <div class="field"><label>Date</label><input type="date" name="expense_date" value="${new Date().toISOString().slice(0, 10)}"></div>
+        <div class="field"><label>Category</label><input name="category" placeholder="Fuel, Rent, Supplies…"></div>
+        <div class="field"><label>Vendor</label><input name="vendor"></div>
+        <div class="field"><label>Type</label><select name="cost_type"><option value="Direct Cost">Direct Cost</option><option value="Overhead" selected>Overhead</option></select></div>
+        <div class="field"><label>Amount (SAR)</label><input name="amount" type="number" step="0.01" min="0.01" required></div>
+      </div>
+      <div class="form-row" style="margin-top:10px">
+        <div class="field"><label>Description</label><input name="description"></div>
+        <div class="field" style="flex:0"><label>&nbsp;</label><button class="btn btn-primary" type="submit">Add</button></div>
+      </div>
+    </form>
+  </div>
+  <div class="card">
+    <table>
+      <thead><tr><th>No.</th><th>Date</th><th>Category</th><th>Vendor</th><th class="right">Amount</th><th>Status</th><th>Payment</th><th></th></tr></thead>
+      <tbody>
+        ${state.expenses.length ? state.expenses.map((e) => `
+          <tr>
+            <td>${esc(e.expense_number)}</td><td>${fmtDate(e.expense_date)}</td><td>${esc(e.category)}</td><td>${esc(e.vendor)}</td>
+            <td class="right">${fmtMoney(e.amount)}</td>
+            <td>${pill(e.status, expensePillCls(e.status))}</td>
+            <td>${e.status === "Approved" ? pill(e.payment_status, e.payment_status === "Paid" ? "paid" : "unpaid") : "—"}</td>
+            <td>
+              ${e.status === "Pending" ? `
+                <button class="btn btn-ghost btn-sm" onclick="App.approveExpense('${e.id}')">Approve</button>
+                <button class="btn btn-ghost btn-sm" onclick="App.rejectExpense('${e.id}')">Reject</button>` : ""}
+              ${e.status === "Approved" && e.payment_status === "Unpaid" ? `
+                <select onchange="App.payExpense('${e.id}',event)">
+                  <option value="">Pay from…</option>
+                  ${state.bankAccounts.map((b) => `<option value="${b.id}">${esc(b.name)}</option>`).join("")}
+                </select>` : ""}
+            </td>
+          </tr>`).join("") : `<tr><td colspan="8" class="empty-state">No expenses yet.</td></tr>`}
+      </tbody>
+    </table>
+  </div>`;
+}
+
+// --------------------------------------------------------------- Employees
+
+function renderEmployees() {
+  return `
+  <h2 class="page-title">Employees</h2>
+  <p class="page-sub">The people you run payroll for.</p>
+  <div class="card">
+    <h3>Add an employee</h3>
+    <form onsubmit="return App.addEmployee(event)">
+      <div class="form-row">
+        <div class="field"><label>Name *</label><input name="name" required></div>
+        <div class="field"><label>Role</label><input name="role"></div>
+        <div class="field"><label>Monthly salary (SAR)</label><input name="monthly_salary" type="number" step="0.01" min="0"></div>
+        <div class="field" style="flex:0"><label>&nbsp;</label><button class="btn btn-primary" type="submit">Add</button></div>
+      </div>
+    </form>
+  </div>
+  <div class="card">
+    <table>
+      <thead><tr><th>Name</th><th>Role</th><th class="right">Monthly salary</th><th>Status</th><th></th></tr></thead>
+      <tbody>
+        ${state.employees.length ? state.employees.map((e) => `
+          <tr>
+            <td>${esc(e.name)}</td><td>${esc(e.role)}</td><td class="right">${e.monthly_salary !== null ? fmtMoney(e.monthly_salary) : "—"}</td>
+            <td>${e.active ? pill("Active", "delivered") : pill("Inactive", "cancelled")}</td>
+            <td><button class="link-btn" onclick="App.toggleEmployeeActive('${e.id}',${e.active})">${e.active ? "deactivate" : "reactivate"}</button></td>
+          </tr>`).join("") : `<tr><td colspan="5" class="empty-state">No employees yet.</td></tr>`}
+      </tbody>
+    </table>
+  </div>`;
+}
+
+// ----------------------------------------------------------------- Payroll
+
+function payrollPillCls(status) {
+  return { Draft: "pending", Approved: "process", Paid: "paid" }[status] || "pending";
+}
+function renderPayroll() {
+  const activeEmployees = state.employees.filter((e) => e.active);
+  return `
+  <h2 class="page-title">Payroll</h2>
+  <p class="page-sub">Create a run for the period, add each employee's line, approve it, then pay it — paying is what posts it to the ledger.</p>
+  <div class="card">
+    <h3>New payroll run</h3>
+    <form onsubmit="return App.addPayrollRun(event)">
+      <div class="form-row">
+        <div class="field"><label>Period</label><input name="period" placeholder="e.g. 2026-09" required></div>
+        <div class="field" style="flex:0"><label>&nbsp;</label><button class="btn btn-primary" type="submit">Create run</button></div>
+      </div>
+    </form>
+  </div>
+  <div class="card">
+    <table>
+      <thead><tr><th>No.</th><th>Period</th><th>Status</th><th></th></tr></thead>
+      <tbody>
+        ${state.payrollRuns.length ? state.payrollRuns.map((r) => {
+          const key = "payroll:" + r.id;
+          const open = !!state.expanded[key];
+          const lines = state.payrollLinesByRun[r.id] || [];
+          const netTotal = lines.reduce((s, l) => s + Number(l.net_pay || 0), 0);
+          return `
+          <tr class="clickable" onclick="App.toggle('payroll','${r.id}')">
+            <td>${esc(r.pr_number)}</td><td>${esc(r.period)}</td><td>${pill(r.status, payrollPillCls(r.status))}</td>
+            <td onclick="event.stopPropagation()">
+              ${r.status === "Draft" ? `<button class="btn btn-ghost btn-sm" onclick="App.approvePayrollRun('${r.id}')">Approve</button>` : ""}
+              ${r.status === "Approved" ? `
+                <select onchange="App.payPayrollRun('${r.id}',event)">
+                  <option value="">Pay from…</option>
+                  ${state.bankAccounts.map((b) => `<option value="${b.id}">${esc(b.name)}</option>`).join("")}
+                </select>` : ""}
+            </td>
+          </tr>
+          ${open ? `<tr><td colspan="4"><div class="wo-detail">
+            <table>
+              <thead><tr><th>Employee</th><th class="right">Gross</th><th class="right">Net pay</th><th></th></tr></thead>
+              <tbody>
+                ${lines.length ? lines.map((l) => `
+                  <tr><td>${esc(l.employee_name)}</td><td class="right">${fmtMoney(l.gross_salary)}</td><td class="right">${fmtMoney(l.net_pay)}</td>
+                  <td>${r.status === "Draft" ? `<button class="link-btn" onclick="App.deletePayrollLine('${l.id}','${r.id}')">remove</button>` : ""}</td></tr>
+                `).join("") : `<tr><td colspan="4" class="empty-state">No lines yet.</td></tr>`}
+              </tbody>
+            </table>
+            ${r.status === "Draft" ? `
+              <form class="form-row" style="margin-top:10px" onsubmit="return App.addPayrollLine('${r.id}',event)">
+                <div class="field"><label>Employee</label><select name="employee_id" required>
+                  <option value="">— pick —</option>
+                  ${activeEmployees.map((e) => `<option value="${e.id}">${esc(e.name)}${e.monthly_salary ? " — " + fmtMoney(e.monthly_salary) : ""}</option>`).join("")}
+                </select></div>
+                <div class="field"><label>Gross (SAR)</label><input name="gross_salary" type="number" step="0.01" min="0" placeholder="defaults to salary"></div>
+                <div class="field"><label>Net pay (SAR)</label><input name="net_pay" type="number" step="0.01" min="0" placeholder="defaults to gross"></div>
+                <div class="field" style="flex:0"><label>&nbsp;</label><button class="btn btn-ghost btn-sm" type="submit">Add line</button></div>
+              </form>` : ""}
+            <div class="totals-line">Net total: <b>${fmtMoney(netTotal)}</b></div>
+          </div></td></tr>` : ""}`;
+        }).join("") : `<tr><td colspan="4" class="empty-state">No payroll runs yet.</td></tr>`}
+      </tbody>
+    </table>
+  </div>`;
+}
+
+// ------------------------------------------------------------ Fixed Assets
+
+function renderFixedAssets() {
+  return `
+  <h2 class="page-title">Fixed Assets</h2>
+  <p class="page-sub">Recording a purchase posts it to the ledger immediately. Depreciation runs once a month, on demand.</p>
+  <div class="card">
+    <h3>Record a purchase</h3>
+    <form onsubmit="return App.addFixedAsset(event)">
+      <div class="form-row">
+        <div class="field"><label>Name *</label><input name="name" required></div>
+        <div class="field"><label>Category</label><input name="category"></div>
+        <div class="field"><label>Cost (SAR)</label><input name="cost" type="number" step="0.01" min="0.01" required></div>
+        <div class="field"><label>Purchase date</label><input type="date" name="purchase_date" value="${new Date().toISOString().slice(0, 10)}"></div>
+        <div class="field"><label>Useful life (months)</label><input name="useful_life_months" type="number" step="1" min="1" value="36"></div>
+        <div class="field"><label>Paid from *</label><select name="paid_from" required>
+          <option value="">— pick bank —</option>
+          ${state.bankAccounts.map((b) => `<option value="${b.id}">${esc(b.name)}</option>`).join("")}
+        </select></div>
+        <div class="field" style="flex:0"><label>&nbsp;</label><button class="btn btn-primary" type="submit">Add</button></div>
+      </div>
+    </form>
+  </div>
+  <div class="card">
+    <div class="form-row" style="margin-bottom:12px">
+      <button class="btn btn-ghost btn-sm" onclick="App.runDepreciation()">Run this month's depreciation</button>
+      <span class="subtle">Safe to click any time — each asset only depreciates once per calendar month.</span>
+    </div>
+    <table>
+      <thead><tr><th>No.</th><th>Name</th><th>Category</th><th class="right">Cost</th><th class="right">Accum. depr.</th><th class="right">Book value</th><th>Status</th></tr></thead>
+      <tbody>
+        ${state.fixedAssets.length ? state.fixedAssets.map((a) => `
+          <tr>
+            <td>${esc(a.asset_number)}</td><td>${esc(a.name)}</td><td>${esc(a.category)}</td>
+            <td class="right">${fmtMoney(a.cost)}</td><td class="right">${fmtMoney(a.accumulated_depreciation)}</td>
+            <td class="right">${fmtMoney(Number(a.cost) - Number(a.accumulated_depreciation || 0))}</td>
+            <td>${a.status === "Active" ? pill("Active", "delivered") : pill("Disposed", "cancelled")}</td>
+          </tr>`).join("") : `<tr><td colspan="7" class="empty-state">No fixed assets yet.</td></tr>`}
       </tbody>
     </table>
   </div>`;
