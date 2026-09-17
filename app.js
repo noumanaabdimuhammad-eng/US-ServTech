@@ -316,38 +316,38 @@ App.toggle = function (table, id) {
 };
 
 // ------------------------------------------------------------ customers
+//
+// Customers has no standalone "add" form — it's a read-only directory. New
+// customers enter the system the moment they're named on a new Inquiry (or,
+// if a work order is opened for someone without going through an inquiry
+// first, on that Work Order) — see resolveCustomer() below, which creates
+// the customers row right then rather than leaving an orphaned free-text
+// name on the inquiry/order.
 
-App.addCustomer = async function (ev) {
-  ev.preventDefault();
-  const v = fd(ev.target);
-  if (!v.display_name || !v.display_name.trim()) { showToast("Customer name is required", true); return false; }
-  await guard(sb.from("customers").insert({
-    display_name: v.display_name.trim(),
-    company_name: v.company_name || null,
-    phone: v.phone || null,
-    email: v.email || null,
-    vat_reg_no: v.vat_reg_no || null,
-    city: v.city || null,
-  }), "Customer added");
-  ev.target.reset();
-  await loadCustomers();
-  render();
-  return false;
-};
+// Shared by every "who is this for" form (Inquiries, Work Orders): resolves
+// the chosen existing customer, or creates a brand-new customers row from
+// the typed name so it shows up in the Customers directory from then on.
+async function resolveCustomer(v) {
+  if (v.customer_id) {
+    const c = state.customers.find((x) => x.id === v.customer_id);
+    if (c) return { customer_id: c.id, customer: c.display_name };
+  }
+  const name = (v.customer_name || "").trim();
+  if (!name) return null;
+  const created = await guard(sb.from("customers").insert({ display_name: name }).select().single());
+  state.customers.unshift(created);
+  return { customer_id: created.id, customer: created.display_name };
+}
 
 // ------------------------------------------------------------- inquiries
 
 App.addInquiry = async function (ev) {
   ev.preventDefault();
   const v = fd(ev.target);
-  let customer_id = null, customer = (v.customer_name || "").trim();
-  if (v.customer_id) {
-    const c = state.customers.find((x) => x.id === v.customer_id);
-    if (c) { customer_id = c.id; customer = c.display_name; }
-  }
-  if (!customer) { showToast("Pick a customer or type a name", true); return false; }
+  const who = await resolveCustomer(v);
+  if (!who) { showToast("Pick a customer or type a name", true); return false; }
   await guard(sb.from("inquiries").insert({
-    customer_id, customer,
+    customer_id: who.customer_id, customer: who.customer,
     inquiry_date: v.inquiry_date || new Date().toISOString().slice(0, 10),
     contact_method: v.contact_method || null,
     accounting_system: v.accounting_system || null,
@@ -367,27 +367,10 @@ App.convertInquiry = async function (id, kind) {
 };
 
 // ------------------------------------------------------------ quotations
+//
+// No standalone "new quotation" form — a quotation only ever comes from
+// accepting a conversion on an Inquiry (App.convertInquiry above).
 
-App.addQuotation = async function (ev) {
-  ev.preventDefault();
-  const v = fd(ev.target);
-  let customer_id = null, customer = (v.customer_name || "").trim();
-  if (v.customer_id) {
-    const c = state.customers.find((x) => x.id === v.customer_id);
-    if (c) { customer_id = c.id; customer = c.display_name; }
-  }
-  if (!customer) { showToast("Pick a customer or type a name", true); return false; }
-  await guard(sb.from("quotations").insert({
-    customer_id, customer,
-    quote_date: v.quote_date || new Date().toISOString().slice(0, 10),
-    accounting_system: v.accounting_system || null,
-    discount: Number(v.discount || 0),
-  }), "Quotation added");
-  ev.target.reset();
-  await loadQuotations();
-  render();
-  return false;
-};
 App.acceptQuotation = async function (id) {
   await guard(sb.rpc("accept_quotation", { p_quote_id: id }), "Quotation accepted — work order created");
   await loadQuotations();
@@ -404,14 +387,10 @@ App.rejectQuotation = async function (id) {
 App.addWorkOrder = async function (ev) {
   ev.preventDefault();
   const v = fd(ev.target);
-  let customer_id = null, customer = (v.customer_name || "").trim();
-  if (v.customer_id) {
-    const c = state.customers.find((x) => x.id === v.customer_id);
-    if (c) { customer_id = c.id; customer = c.display_name; }
-  }
-  if (!customer) { showToast("Pick a customer or type a name", true); return false; }
+  const who = await resolveCustomer(v);
+  if (!who) { showToast("Pick a customer or type a name", true); return false; }
   await guard(sb.from("work_orders").insert({
-    customer_id, customer,
+    customer_id: who.customer_id, customer: who.customer,
     wo_date: v.wo_date || new Date().toISOString().slice(0, 10),
     accounting_system: v.accounting_system || "Odoo",
     discount: Number(v.discount || 0),
@@ -720,23 +699,7 @@ function customerOptions(selectedId) {
 function renderCustomers() {
   return `
   <h2 class="page-title">Customers</h2>
-  <p class="page-sub">${state.customers.length} customer${state.customers.length === 1 ? "" : "s"} on file.</p>
-  <div class="card">
-    <h3>Add a customer</h3>
-    <form onsubmit="return App.addCustomer(event)">
-      <div class="form-row">
-        <div class="field"><label>Name *</label><input name="display_name" required></div>
-        <div class="field"><label>Company</label><input name="company_name"></div>
-        <div class="field"><label>VAT reg. no.</label><input name="vat_reg_no"></div>
-      </div>
-      <div class="form-row" style="margin-top:10px">
-        <div class="field"><label>Phone</label><input name="phone"></div>
-        <div class="field"><label>Email</label><input type="email" name="email"></div>
-        <div class="field"><label>City</label><input name="city"></div>
-        <div class="field" style="flex:0"><label>&nbsp;</label><button class="btn btn-primary" type="submit">Add</button></div>
-      </div>
-    </form>
-  </div>
+  <p class="page-sub">${state.customers.length} customer${state.customers.length === 1 ? "" : "s"} on file. New customers are added automatically the first time they're named on an inquiry or work order — this is a read-only directory.</p>
   <div class="card">
     <table>
       <thead><tr><th>No.</th><th>Name</th><th>Company</th><th>Phone</th><th>Email</th><th>City</th></tr></thead>
@@ -843,20 +806,7 @@ function renderInquiries() {
 function renderQuotations() {
   return `
   <h2 class="page-title">Quotations</h2>
-  <p class="page-sub">Accepting a quotation creates its work order automatically.</p>
-  <div class="card">
-    <h3>New quotation</h3>
-    <form onsubmit="return App.addQuotation(event)">
-      <div class="form-row">
-        <div class="field"><label>Customer</label><select name="customer_id">${customerOptions()}</select></div>
-        <div class="field"><label>...or new customer name</label><input name="customer_name"></div>
-        <div class="field"><label>Date</label><input type="date" name="quote_date" value="${new Date().toISOString().slice(0, 10)}"></div>
-        <div class="field"><label>Accounting system</label><select name="accounting_system"><option value="">—</option><option>Odoo</option><option>Zoho</option></select></div>
-        <div class="field"><label>Discount (SAR)</label><input name="discount" type="number" step="0.01" min="0" value="0"></div>
-        <div class="field" style="flex:0"><label>&nbsp;</label><button class="btn btn-primary" type="submit">Add</button></div>
-      </div>
-    </form>
-  </div>
+  <p class="page-sub">Quotations come from Inquiries — convert an inquiry to a quotation there. Accepting one here creates its work order automatically.</p>
   <div class="card">
     <table>
       <thead><tr><th>No.</th><th>Customer</th><th>Date</th><th>Status</th><th></th></tr></thead>
