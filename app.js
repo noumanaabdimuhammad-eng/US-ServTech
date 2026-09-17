@@ -80,7 +80,12 @@ function fmtDateTime(d) {
   return new Date(d).toLocaleString("en-GB", { day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit" });
 }
 function taskTotals(tasks, discount, accountingSystem) {
-  const subtotal = (tasks || []).reduce((s, t) => s + Number(t.price || 0), 0);
+  // Mirrors maybe_finalize_work_order()'s SQL exactly: each line's own
+  // discount comes off its price first, then the order-level discount comes
+  // off that sum, then VAT. Keep this identical to the server's formula (see
+  // migration 015) or the number shown here will drift from what actually
+  // gets posted to the ledger.
+  const subtotal = (tasks || []).reduce((s, t) => s + (Number(t.price || 0) - Number(t.discount || 0)), 0);
   const afterDiscount = Math.max(0, subtotal - Number(discount || 0));
   const rate = accountingSystem === "Odoo" ? VAT_RATE : 0;
   const tax = afterDiscount * rate;
@@ -326,18 +331,64 @@ App.toggle = function (table, id) {
 
 // Shared by every "who is this for" form (Inquiries, Work Orders): resolves
 // the chosen existing customer, or creates a brand-new customers row from
-// the typed name so it shows up in the Customers directory from then on.
+// the typed name so it shows up in the Customers directory from then on. A
+// brand-new customer needs at least a Name, Invoice Name and Contact — VAT
+// and the address fields are added later from the Customers directory (see
+// App.updateCustomer / renderCustomerEditor below), since they're rarely
+// known the moment a new lead comes in. Returns the resolved {customer_id,
+// customer}, the string "invalid" if a new-customer attempt was missing a
+// required field (a toast has already been shown), or null if nothing was
+// picked or typed at all.
 async function resolveCustomer(v) {
   if (v.customer_id) {
     const c = state.customers.find((x) => x.id === v.customer_id);
     if (c) return { customer_id: c.id, customer: c.display_name };
   }
   const name = (v.customer_name || "").trim();
-  if (!name) return null;
-  const created = await guard(sb.from("customers").insert({ display_name: name }).select().single());
+  const invoiceName = (v.customer_invoice_name || "").trim();
+  const contact = (v.customer_contact || "").trim();
+  if (!name && !invoiceName && !contact) return null;
+  if (!name || !invoiceName || !contact) {
+    showToast("A new customer needs a Name, Invoice Name and Contact", true);
+    return "invalid";
+  }
+  const created = await guard(sb.from("customers").insert({
+    display_name: name, invoice_name: invoiceName, contact,
+  }).select().single());
   state.customers.unshift(created);
   return { customer_id: created.id, customer: created.display_name };
 }
+
+// The only way customer records get changed once they exist — fills in the
+// VAT number and address fields that usually aren't known yet when a lead
+// first comes in (see resolveCustomer above).
+App.updateCustomer = async function (id, ev) {
+  ev.preventDefault();
+  const v = fd(ev.target);
+  const name = (v.display_name || "").trim();
+  if (!name) { showToast("Customer name is required", true); return false; }
+  await guard(sb.from("customers").update({
+    display_name: name,
+    invoice_name: (v.invoice_name || "").trim() || null,
+    contact: (v.contact || "").trim() || null,
+    company_name: (v.company_name || "").trim() || null,
+    email: (v.email || "").trim() || null,
+    phone: (v.phone || "").trim() || null,
+    mobile: (v.mobile || "").trim() || null,
+    vat_reg_no: (v.vat_reg_no || "").trim() || null,
+    building_no: (v.building_no || "").trim() || null,
+    street: (v.street || "").trim() || null,
+    district: (v.district || "").trim() || null,
+    postal_code: (v.postal_code || "").trim() || null,
+    city: (v.city || "").trim() || null,
+    state: (v.state || "").trim() || null,
+    country: (v.country || "").trim() || "Saudi Arabia",
+  }).eq("id", id), "Customer updated");
+  state.expanded["customers:" + id] = false;
+  await loadCustomers();
+  render();
+  return false;
+};
 
 // ------------------------------------------------------------- inquiries
 
@@ -345,7 +396,8 @@ App.addInquiry = async function (ev) {
   ev.preventDefault();
   const v = fd(ev.target);
   const who = await resolveCustomer(v);
-  if (!who) { showToast("Pick a customer or type a name", true); return false; }
+  if (who === "invalid") return false;
+  if (!who) { showToast("Pick a customer or enter a new one's details", true); return false; }
   await guard(sb.from("inquiries").insert({
     customer_id: who.customer_id, customer: who.customer,
     inquiry_date: v.inquiry_date || new Date().toISOString().slice(0, 10),
@@ -388,7 +440,8 @@ App.addWorkOrder = async function (ev) {
   ev.preventDefault();
   const v = fd(ev.target);
   const who = await resolveCustomer(v);
-  if (!who) { showToast("Pick a customer or type a name", true); return false; }
+  if (who === "invalid") return false;
+  if (!who) { showToast("Pick a customer or enter a new one's details", true); return false; }
   await guard(sb.from("work_orders").insert({
     customer_id: who.customer_id, customer: who.customer,
     wo_date: v.wo_date || new Date().toISOString().slice(0, 10),
@@ -414,10 +467,13 @@ App.addTask = async function (parentType, parentId, ev) {
   ev.preventDefault();
   const v = fd(ev.target);
   if (!v.description || !v.description.trim()) { showToast("Item description is required", true); return false; }
+  if (!v.service_type) { showToast("Pick a service — Calibration, Inspection or Card", true); return false; }
   await guard(sb.from("tasks").insert({
     parent_type: parentType, parent_id: parentId,
+    service_type: v.service_type,
     description: v.description.trim(),
     price: Number(v.price || 0),
+    discount: Number(v.discount || 0),
   }));
   ev.target.reset();
   await loadTasksFor(parentId);
@@ -699,55 +755,114 @@ function customerOptions(selectedId) {
 function renderCustomers() {
   return `
   <h2 class="page-title">Customers</h2>
-  <p class="page-sub">${state.customers.length} customer${state.customers.length === 1 ? "" : "s"} on file. New customers are added automatically the first time they're named on an inquiry or work order — this is a read-only directory.</p>
+  <p class="page-sub">${state.customers.length} customer${state.customers.length === 1 ? "" : "s"} on file. New customers are added automatically — with a Name, Invoice Name and Contact — the first time they're named on an inquiry or work order. VAT and the address usually aren't known yet at that point; open Edit here to fill them in once they arrive.</p>
   <div class="card">
     <table>
-      <thead><tr><th>No.</th><th>Name</th><th>Company</th><th>Phone</th><th>Email</th><th>City</th></tr></thead>
+      <thead><tr><th>No.</th><th>Name</th><th>Invoice name</th><th>Contact</th><th>City</th><th>VAT no.</th><th></th></tr></thead>
       <tbody>
-        ${state.customers.length ? state.customers.map((c) => `
-          <tr>
+        ${state.customers.length ? state.customers.map((c) => {
+          const key = "customers:" + c.id;
+          const open = !!state.expanded[key];
+          return `
+          <tr class="clickable" onclick="App.toggle('customers','${c.id}')">
             <td>${esc(c.customer_number)}</td>
             <td>${esc(c.display_name)}</td>
-            <td>${esc(c.company_name)}</td>
-            <td>${esc(c.phone || c.mobile)}</td>
-            <td>${esc(c.email)}</td>
+            <td>${esc(c.invoice_name)}</td>
+            <td>${esc(c.contact)}</td>
             <td>${esc(c.city)}</td>
-          </tr>`).join("") : `<tr><td colspan="6" class="empty-state">No customers yet.</td></tr>`}
+            <td>${esc(c.vat_reg_no)}</td>
+            <td onclick="event.stopPropagation()"><button class="link-btn" onclick="App.toggle('customers','${c.id}')">${open ? "close" : "edit"}</button></td>
+          </tr>
+          ${open ? `<tr><td colspan="7">${renderCustomerEditor(c)}</td></tr>` : ""}`;
+        }).join("") : `<tr><td colspan="7" class="empty-state">No customers yet.</td></tr>`}
       </tbody>
     </table>
   </div>`;
 }
 
+function renderCustomerEditor(c) {
+  return `
+  <div class="wo-detail">
+    <form onsubmit="return App.updateCustomer('${c.id}',event)">
+      <div class="form-row">
+        <div class="field"><label>Customer name</label><input name="display_name" value="${esc(c.display_name)}" required></div>
+        <div class="field"><label>Invoice name</label><input name="invoice_name" value="${esc(c.invoice_name)}"></div>
+        <div class="field"><label>Contact</label><input name="contact" value="${esc(c.contact)}"></div>
+        <div class="field"><label>Company name</label><input name="company_name" value="${esc(c.company_name)}"></div>
+      </div>
+      <div class="form-row" style="margin-top:10px">
+        <div class="field"><label>Email</label><input name="email" type="email" value="${esc(c.email)}"></div>
+        <div class="field"><label>Phone</label><input name="phone" value="${esc(c.phone)}"></div>
+        <div class="field"><label>Mobile</label><input name="mobile" value="${esc(c.mobile)}"></div>
+        <div class="field"><label>VAT registration no.</label><input name="vat_reg_no" value="${esc(c.vat_reg_no)}"></div>
+      </div>
+      <div class="form-row" style="margin-top:10px">
+        <div class="field"><label>Building no.</label><input name="building_no" value="${esc(c.building_no)}"></div>
+        <div class="field"><label>Street</label><input name="street" value="${esc(c.street)}"></div>
+        <div class="field"><label>District</label><input name="district" value="${esc(c.district)}"></div>
+        <div class="field"><label>Postal code</label><input name="postal_code" value="${esc(c.postal_code)}"></div>
+      </div>
+      <div class="form-row" style="margin-top:10px">
+        <div class="field"><label>City</label><input name="city" value="${esc(c.city)}"></div>
+        <div class="field"><label>State / Province</label><input name="state" value="${esc(c.state)}"></div>
+        <div class="field"><label>Country</label><input name="country" value="${esc(c.country) || "Saudi Arabia"}"></div>
+        <div class="field" style="flex:0"><label>&nbsp;</label><button class="btn btn-primary" type="submit">Save</button></div>
+      </div>
+    </form>
+  </div>`;
+}
+
 // ---------------------------------------------------------- Tasks editor
+
+// One customer may need several different services on the same order —
+// calibration of a batch of tools, an inspection, a card — so each line
+// item picks which of these it is. Kept to exactly these three because
+// that's what's costed and certified differently downstream.
+const SERVICE_TYPES = ["Calibration", "Inspection", "Card"];
 
 function renderTasksEditor(parentType, parentId, discount, accountingSystem, showStatus) {
   const tasks = state.tasksByParent[parentId] || [];
   const t = taskTotals(tasks, discount, accountingSystem);
+  const mgmt = isMgmt();
   return `
   <div class="wo-detail">
     <table>
-      <thead><tr><th>Description</th><th class="right">Price (SAR)</th>${showStatus ? "<th>Status</th>" : ""}<th></th></tr></thead>
+      <thead><tr><th>Service</th><th>Description</th><th class="right">Price (SAR)</th><th class="right">Discount (SAR)</th>${showStatus ? "<th>Status</th>" : ""}<th></th></tr></thead>
       <tbody>
-        ${tasks.length ? tasks.map((tk) => `
+        ${tasks.length ? tasks.map((tk) => {
+          const locked = showStatus && tk.status === "Delivered" && !mgmt;
+          return `
           <tr>
+            <td>${esc(tk.service_type) || "—"}</td>
             <td>${esc(tk.description)}</td>
             <td class="right">${fmtMoney(tk.price)}</td>
+            <td class="right">${fmtMoney(tk.discount)}</td>
             ${showStatus ? `<td>
-              <select onchange="App.updateTaskStatus('${tk.id}','${parentId}',this.value)">
-                ${["In Process", "Completed", "Delivered"].map((s) => `<option value="${s}" ${s === tk.status ? "selected" : ""}>${s}</option>`).join("")}
-              </select>
+              ${locked
+                ? `${statusPill(tk.status)}<div class="subtle">locked — Owner/Manager only</div>`
+                : `<select onchange="App.updateTaskStatus('${tk.id}','${parentId}',this.value)">
+                    ${["In Process", "Completed", "Delivered"].map((s) => `<option value="${s}" ${s === tk.status ? "selected" : ""}>${s}</option>`).join("")}
+                  </select>`}
             </td>` : ""}
-            <td><button class="link-btn" onclick="App.deleteTask('${tk.id}','${parentId}')">remove</button></td>
-          </tr>`).join("") : `<tr><td colspan="${showStatus ? 4 : 3}" class="empty-state">No line items yet.</td></tr>`}
+            <td>${locked ? "" : `<button class="link-btn" onclick="App.deleteTask('${tk.id}','${parentId}')">remove</button>`}</td>
+          </tr>`;
+        }).join("") : `<tr><td colspan="${showStatus ? 6 : 5}" class="empty-state">No line items yet.</td></tr>`}
       </tbody>
     </table>
     <form class="form-row" style="margin-top:10px" onsubmit="return App.addTask('${parentType}','${parentId}',event)">
-      <div class="field"><label>Add item — description</label><input name="description" required></div>
+      <div class="field"><label>Service</label>
+        <select name="service_type" required>
+          <option value="">— pick —</option>
+          ${SERVICE_TYPES.map((s) => `<option value="${s}">${s}</option>`).join("")}
+        </select>
+      </div>
+      <div class="field"><label>Description</label><input name="description" required placeholder="e.g. Torque wrench 0–200 Nm"></div>
       <div class="field"><label>Price (SAR)</label><input name="price" type="number" step="0.01" min="0" required></div>
+      <div class="field"><label>Discount (SAR)</label><input name="discount" type="number" step="0.01" min="0" value="0"></div>
       <div class="field" style="flex:0"><label>&nbsp;</label><button class="btn btn-ghost btn-sm" type="submit">Add item</button></div>
     </form>
     <div class="totals-line">
-      Subtotal: <b>${fmtMoney(t.subtotal)}</b> &nbsp; Discount: <b>${fmtMoney(discount)}</b> &nbsp;
+      Items subtotal (after item discounts): <b>${fmtMoney(t.subtotal)}</b> &nbsp; Order discount: <b>${fmtMoney(discount)}</b> &nbsp;
       VAT (${t.rate > 0 ? "15%" : "—"}): <b>${fmtMoney(t.tax)}</b> &nbsp; Total: <b>${fmtMoney(t.total)}</b>
       <span class="subtle">— computed here for display; not stored.</span>
     </div>
@@ -759,14 +874,18 @@ function renderTasksEditor(parentType, parentId, discount, accountingSystem, sho
 function renderInquiries() {
   return `
   <h2 class="page-title">Inquiries</h2>
-  <p class="page-sub">Capture a new lead, price it with line items, then convert it to a quotation or straight to a work order.</p>
+  <p class="page-sub">Capture a new lead, then open it below to price it with line items — pick Calibration, Inspection or Card for each, one customer can need several — before converting it to a quotation or straight to a work order.</p>
   <div class="card">
     <h3>New inquiry</h3>
     <form onsubmit="return App.addInquiry(event)">
       <div class="form-row">
         <div class="field"><label>Customer</label><select name="customer_id">${customerOptions()}</select></div>
-        <div class="field"><label>...or new customer name</label><input name="customer_name"></div>
         <div class="field"><label>Date</label><input type="date" name="inquiry_date" value="${new Date().toISOString().slice(0, 10)}"></div>
+      </div>
+      <div class="form-row" style="margin-top:10px">
+        <div class="field"><label>…or new customer — Name</label><input name="customer_name" placeholder="Required if new"></div>
+        <div class="field"><label>Invoice name</label><input name="customer_invoice_name" placeholder="Name as it appears on the invoice"></div>
+        <div class="field"><label>Contact</label><input name="customer_contact" placeholder="Phone or email"></div>
       </div>
       <div class="form-row" style="margin-top:10px">
         <div class="field"><label>Contact method</label><input name="contact_method" placeholder="Phone / Email / Visit"></div>
@@ -838,15 +957,21 @@ function statusPillForQuote(s) {
 function renderWorkOrders() {
   return `
   <h2 class="page-title">Work Orders</h2>
-  <p class="page-sub">Mark each item Delivered as it's finished — once every item on an order is Delivered, its invoice and revenue posting happen by themselves.</p>
+  <p class="page-sub">Mark each item Delivered as it's finished — once every item on an order is Delivered, its invoice and revenue posting happen by themselves. Once an item is Delivered, only an Owner or Manager can change or remove it.</p>
   <div class="card">
     <h3>New work order</h3>
     <form onsubmit="return App.addWorkOrder(event)">
       <div class="form-row">
         <div class="field"><label>Customer</label><select name="customer_id">${customerOptions()}</select></div>
-        <div class="field"><label>...or new customer name</label><input name="customer_name"></div>
         <div class="field"><label>Date</label><input type="date" name="wo_date" value="${new Date().toISOString().slice(0, 10)}"></div>
         <div class="field"><label>Accounting system</label><select name="accounting_system"><option>Odoo</option><option>Zoho</option></select></div>
+      </div>
+      <div class="form-row" style="margin-top:10px">
+        <div class="field"><label>…or new customer — Name</label><input name="customer_name" placeholder="Required if new"></div>
+        <div class="field"><label>Invoice name</label><input name="customer_invoice_name" placeholder="Name as it appears on the invoice"></div>
+        <div class="field"><label>Contact</label><input name="customer_contact" placeholder="Phone or email"></div>
+      </div>
+      <div class="form-row" style="margin-top:10px">
         <div class="field"><label>Discount (SAR)</label><input name="discount" type="number" step="0.01" min="0" value="0"></div>
         <div class="field" style="flex:0"><label>&nbsp;</label><button class="btn btn-primary" type="submit">Add</button></div>
       </div>
