@@ -703,6 +703,7 @@ App.pickInquiryCustomer = function (id) {
 App.addInquiry = async function (ev) {
   ev.preventDefault();
   const d = state.inquiryDraft;
+  if (!d.accounting_system) { showToast("Pick an accounting system — Odoo or Zoho — it's what a work order needs before it can be accepted or delivered", true); return false; }
   const items = d.items.filter((it) => (it.description || "").trim() || Number(it.price || 0) > 0 || it.service_type);
   if (!items.length) { showToast("Add at least one service line item", true); return false; }
   for (const it of items) {
@@ -1308,14 +1309,22 @@ const SERVICE_TYPES = ["Calibration", "Inspection", "Card"];
 function renderTasksEditor(parentType, parentId, discount, accountingSystem, showStatus) {
   const tasks = state.tasksByParent[parentId] || [];
   const t = taskTotals(tasks, discount, accountingSystem);
-  const mgmt = isMgmt();
+  // A work order's line items are fixed the moment it's created — they come
+  // from whichever inquiry or quotation it was converted from, and the
+  // database itself now refuses any insert or delete against them (see
+  // migration 019), for every role, no exceptions. Same for a Delivered
+  // item's status: once set, it's permanently locked, not just for
+  // Officers. This function still serves Inquiry/Quotation detail rows too
+  // (parentType "Inquiry"/"Quotation"), where adding or removing items
+  // stays open, since those are still being drafted.
+  const itemsLocked = parentType === "Work Order";
   return `
   <div class="wo-detail">
     <table>
-      <thead><tr><th>Service</th><th>Description</th><th class="right">Price (SAR)</th><th class="right">Discount (SAR)</th>${showStatus ? "<th>Status</th>" : ""}<th></th></tr></thead>
+      <thead><tr><th>Service</th><th>Description</th><th class="right">Price (SAR)</th><th class="right">Discount (SAR)</th>${showStatus ? "<th>Status</th>" : ""}${itemsLocked ? "" : "<th></th>"}</tr></thead>
       <tbody>
         ${tasks.length ? tasks.map((tk) => {
-          const locked = showStatus && tk.status === "Delivered" && !mgmt;
+          const statusLocked = showStatus && tk.status === "Delivered";
           return `
           <tr>
             <td>${esc(tk.service_type) || "—"}</td>
@@ -1323,18 +1332,20 @@ function renderTasksEditor(parentType, parentId, discount, accountingSystem, sho
             <td class="right">${fmtMoney(tk.price)}</td>
             <td class="right">${fmtMoney(tk.discount)}</td>
             ${showStatus ? `<td>
-              ${locked
-                ? `${statusPill(tk.status)}<div class="subtle">locked — Owner/Manager only</div>`
+              ${statusLocked
+                ? `${statusPill(tk.status)}<div class="subtle">locked — final</div>`
                 : `<select onchange="App.updateTaskStatus('${tk.id}','${parentId}',this.value)">
                     ${["In Process", "Completed", "Delivered"].map((s) => `<option value="${s}" ${s === tk.status ? "selected" : ""}>${s}</option>`).join("")}
                   </select>`}
             </td>` : ""}
-            <td>${locked ? "" : `<button class="link-btn" onclick="App.deleteTask('${tk.id}','${parentId}')">remove</button>`}</td>
+            ${itemsLocked ? "" : `<td><button class="link-btn" onclick="App.deleteTask('${tk.id}','${parentId}')">remove</button></td>`}
           </tr>`;
         }).join("") : `<tr><td colspan="${showStatus ? 6 : 5}" class="empty-state">No line items yet.</td></tr>`}
       </tbody>
     </table>
-    <form class="form-row" style="margin-top:10px" onsubmit="return App.addTask('${parentType}','${parentId}',event)">
+    ${itemsLocked
+      ? `<p class="subtle" style="margin-top:10px">Line items are fixed once a work order is created — they came from the inquiry or quotation it was converted from and can't be added to or removed by anyone.</p>`
+      : `<form class="form-row" style="margin-top:10px" onsubmit="return App.addTask('${parentType}','${parentId}',event)">
       <div class="field"><label>Service</label>
         <select name="service_type" required>
           <option value="">— pick —</option>
@@ -1345,7 +1356,7 @@ function renderTasksEditor(parentType, parentId, discount, accountingSystem, sho
       <div class="field"><label>Price (SAR)</label><input name="price" type="number" step="0.01" min="0" required></div>
       <div class="field"><label>Discount (SAR)</label><input name="discount" type="number" step="0.01" min="0" value="0"></div>
       <div class="field" style="flex:0"><label>&nbsp;</label><button class="btn btn-ghost btn-sm" type="submit">Add item</button></div>
-    </form>
+    </form>`}
     <div class="totals-line">
       Items subtotal (after item discounts): <b>${fmtMoney(t.subtotal)}</b> &nbsp; Order discount: <b>${fmtMoney(discount)}</b> &nbsp;
       VAT (${t.rate > 0 ? "15%" : "—"}): <b>${fmtMoney(t.tax)}</b> &nbsp; Total: <b>${fmtMoney(t.total)}</b>
@@ -1418,9 +1429,9 @@ function renderInquiries() {
         </div>
         <div class="field"><label>Date</label><input type="date" value="${esc(d.inquiry_date)}" oninput="App.setDraftField('inquiry_date',this.value)"></div>
         <div class="field"><label>Contact method</label><input value="${esc(d.contact_method)}" oninput="App.setDraftField('contact_method',this.value)" placeholder="Phone / Email / Visit"></div>
-        <div class="field"><label>Accounting system</label>
-          <select onchange="App.setDraftField('accounting_system',this.value)">
-            <option value="" ${!d.accounting_system ? "selected" : ""}>—</option>
+        <div class="field"><label>Accounting system *</label>
+          <select required onchange="App.setDraftField('accounting_system',this.value)">
+            <option value="" ${!d.accounting_system ? "selected" : ""}>— pick —</option>
             <option ${d.accounting_system === "Odoo" ? "selected" : ""}>Odoo</option>
             <option ${d.accounting_system === "Zoho" ? "selected" : ""}>Zoho</option>
           </select>
@@ -1519,7 +1530,7 @@ function statusPillForQuote(s) {
 function renderWorkOrders() {
   return `
   <h2 class="page-title">Work Orders</h2>
-  <p class="page-sub">Work orders come from Inquiries — convert one directly, or accept its Quotation. Mark each item Delivered as it's finished; once every item on an order is Delivered, its invoice and revenue posting happen by themselves. Once an item is Delivered, only an Owner or Manager can change or remove it.</p>
+  <p class="page-sub">Work orders come from Inquiries — convert one directly, or accept its Quotation. Line items are fixed the moment a work order is created — no one can add or remove one afterward. Mark each item Delivered as it's finished; once every item on an order is Delivered, its invoice and revenue posting happen by themselves, and a Delivered item's status is then locked for good.</p>
   <div class="card">
     <table>
       <thead><tr><th>No.</th><th>Customer</th><th>Date</th><th>Status</th><th>Invoice</th><th></th></tr></thead>
