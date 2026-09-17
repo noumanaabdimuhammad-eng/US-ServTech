@@ -1,9 +1,19 @@
-// US ServTech — Operations & Accounts
+// US ServTech — Operations & Finance
 // Vanilla JS single-page app. No build step, no framework.
 // Backend: Supabase (Postgres + Auth + Realtime). All numbering, invoice
 // generation, revenue posting and ledger balances are computed server-side
-// by database triggers/functions — this file only reads/writes rows and
-// calls a handful of RPCs; it never posts journal entries itself.
+// by database triggers/functions. The app is split into two modules:
+// Operations (Dashboard through Invoices — every role) and Finance (Chart
+// of Accounts through Period Close — Owner/Manager only, which is also how
+// the database's own row-level security already gates every finance table,
+// so an Officer calling a finance RPC directly gets nothing back either).
+// Automated postings (revenue, payments, expenses, payroll, depreciation)
+// still happen entirely server-side via triggers, exactly as before. This
+// file adds exactly one way to write a journal entry by hand — the manual
+// Journal Entry form, which calls post_manual_journal_entry() — plus the
+// read-only reporting RPCs (trial_balance, income_statement,
+// net_income_to_date, cash_flow_statement, general_ledger) and period
+// locking (accounting_periods + close/reopen_accounting_period()).
 
 const SUPABASE_URL = "https://xeefkivvlhsxepezypsb.supabase.co";
 const SUPABASE_KEY = "sb_publishable_KWvrmZGMETiKmEl1iGNw9A_pKLrUqhX";
@@ -19,23 +29,55 @@ const VAT_RATE = 0.15;
 
 const MGMT_ROLES = ["Owner", "Manager"];
 
-const NAV = [
-  { id: "dashboard", label: "Dashboard" },
-  { id: "customers", label: "Customers" },
-  { id: "inquiries", label: "Inquiries" },
-  { id: "quotations", label: "Quotations" },
-  { id: "workorders", label: "Work Orders" },
-  { id: "invoices", label: "Invoices" },
-  { id: "expenses", label: "Expenses", mgmtOnly: true },
-  { id: "employees", label: "Employees", mgmtOnly: true },
-  { id: "payroll", label: "Payroll", mgmtOnly: true },
-  { id: "fixedassets", label: "Fixed Assets", mgmtOnly: true },
-  { id: "ledger", label: "Ledger", mgmtOnly: true },
-];
+// Two modules. Operations is everything through Invoices, for every role.
+// Finance is Chart of Accounts onward — gated to Owner/Manager both in the
+// module switch below and, independently, by the database's own RLS on
+// every finance table, so this is a UI convenience, not the real boundary.
+const MODULES = {
+  operations: {
+    label: "Operations",
+    tabs: [
+      { id: "dashboard", label: "Dashboard" },
+      { id: "customers", label: "Customers" },
+      { id: "inquiries", label: "Inquiries" },
+      { id: "quotations", label: "Quotations" },
+      { id: "workorders", label: "Work Orders" },
+      { id: "invoices", label: "Invoices" },
+    ],
+  },
+  finance: {
+    label: "Finance",
+    tabs: [
+      { id: "chartofaccounts", label: "Chart of Accounts" },
+      { id: "journalentries", label: "Journal Entries" },
+      { id: "generalledger", label: "General Ledger" },
+      { id: "trialbalance", label: "Trial Balance" },
+      { id: "incomestatement", label: "Income Statement" },
+      { id: "balancesheet", label: "Balance Sheet" },
+      { id: "cashflow", label: "Cash Flow" },
+      { id: "araging", label: "AR Aging" },
+      { id: "apaging", label: "AP Aging" },
+      { id: "bankaccounts", label: "Bank Accounts" },
+      { id: "expenses", label: "Expenses" },
+      { id: "employees", label: "Employees" },
+      { id: "payroll", label: "Payroll" },
+      { id: "fixedassets", label: "Fixed Assets" },
+      { id: "periodclose", label: "Period Close" },
+    ],
+  },
+};
+function moduleForView(view) {
+  for (const mid of Object.keys(MODULES)) {
+    if (MODULES[mid].tabs.some((t) => t.id === view)) return mid;
+  }
+  return "operations";
+}
+const AGING_BUCKETS = ["0–30 days", "31–60 days", "61–90 days", "90+ days"];
 
 const state = {
   session: null,
   profile: null,
+  module: "operations",
   view: "dashboard",
   customers: [],
   inquiries: [],
@@ -50,6 +92,28 @@ const state = {
   fixedAssets: [],
   accountBalances: [],
   bankBalances: [],
+  journalEntries: [],
+  journalLinesByJe: {},
+  accountingPeriods: [],
+  trialBalanceRows: [],
+  incomeStatementRows: [],
+  balanceSheetRows: [],
+  balanceSheetNetIncome: 0,
+  cashFlowRows: [],
+  cashFlowBeginCash: 0,
+  cashFlowEndCash: 0,
+  glRows: [],
+  glQuery: { account: "", from: "", to: "" },
+  arInvoices: [], arTasksByInvoice: {}, arWoById: {},
+  apExpenses: [], apPayrollRuns: [], apPayrollNetByRun: {},
+  jeDraft: null,        // the in-progress "New journal entry" form — see freshJeDraft()
+  periodDraft: { period_label: "", start_date: "", end_date: "" },
+  statementDates: {
+    trialbalance: { asOf: new Date().toISOString().slice(0, 10) },
+    incomestatement: { from: firstOfThisMonth(), to: new Date().toISOString().slice(0, 10) },
+    balancesheet: { asOf: new Date().toISOString().slice(0, 10) },
+    cashflow: { from: firstOfThisMonth(), to: new Date().toISOString().slice(0, 10) },
+  },
   tasksByParent: {},   // parent_id -> [task,...]
   expanded: {},        // "table:id" -> true
   inquiryDraft: null,  // the in-progress "New inquiry" form — see freshInquiryDraft()
@@ -102,6 +166,42 @@ function statusPill(status) {
 }
 function isMgmt() {
   return state.profile && MGMT_ROLES.includes(state.profile.role);
+}
+function isOwner() {
+  return state.profile && state.profile.role === "Owner";
+}
+function firstOfThisMonth() {
+  const d = new Date();
+  return new Date(d.getFullYear(), d.getMonth(), 1).toISOString().slice(0, 10);
+}
+function dayBefore(dateStr) {
+  const d = new Date(dateStr + "T00:00:00");
+  d.setDate(d.getDate() - 1);
+  return d.toISOString().slice(0, 10);
+}
+// How long an AR/AP item has been outstanding, bucketed the way the AR/AP
+// Aging reports group them — see AGING_BUCKETS above.
+function agingBucket(dateStr) {
+  if (!dateStr) return AGING_BUCKETS[0];
+  const days = Math.floor((Date.now() - new Date(dateStr + "T00:00:00").getTime()) / 86400000);
+  if (days <= 30) return AGING_BUCKETS[0];
+  if (days <= 60) return AGING_BUCKETS[1];
+  if (days <= 90) return AGING_BUCKETS[2];
+  return AGING_BUCKETS[3];
+}
+function agingPillCls(bucket) {
+  return { [AGING_BUCKETS[0]]: "delivered", [AGING_BUCKETS[1]]: "completed", [AGING_BUCKETS[2]]: "completed", [AGING_BUCKETS[3]]: "cancelled" }[bucket] || "process";
+}
+// Every account a journal-entry line can be posted to: real Chart of
+// Accounts codes (from account_balances, which lists every COA row) plus
+// the synthetic CASH-<bank_id> codes bank accounts post under.
+function glAccountOptions(selected) {
+  const coaOpts = state.accountBalances
+    .slice().sort((a, b) => a.code.localeCompare(b.code))
+    .map((c) => `<option value="${esc(c.code)}" ${c.code === selected ? "selected" : ""}>${esc(c.code)} — ${esc(c.name)}</option>`).join("");
+  const bankOpts = state.bankAccounts
+    .map((b) => `<option value="CASH-${b.id}" ${("CASH-" + b.id) === selected ? "selected" : ""}>Cash — ${esc(b.name)}</option>`).join("");
+  return `<option value="">— pick account —</option>${coaOpts}${bankOpts}`;
 }
 function showToast(msg, isError) {
   state.toast = { msg, isError };
@@ -166,6 +266,110 @@ async function loadLedger() {
   if (!a.error) state.accountBalances = a.data || [];
   if (!b.error) state.bankBalances = b.data || [];
 }
+async function loadJournalEntries() {
+  if (!isMgmt()) return;
+  const { data, error } = await sb.from("journal_entries").select("*")
+    .order("je_date", { ascending: false }).order("je_number", { ascending: false }).limit(300);
+  if (!error) state.journalEntries = data || [];
+}
+async function loadJournalLines(jeId) {
+  const { data, error } = await sb.from("journal_lines").select("*").eq("journal_entry_id", jeId).order("created_at");
+  if (!error) state.journalLinesByJe[jeId] = data || [];
+}
+async function loadAccountingPeriods() {
+  if (!isMgmt()) return;
+  const { data, error } = await sb.from("accounting_periods").select("*").order("start_date", { ascending: false });
+  if (!error) state.accountingPeriods = data || [];
+}
+async function loadTrialBalance() {
+  if (!isMgmt()) return;
+  const { data, error } = await sb.rpc("trial_balance", { p_as_of: state.statementDates.trialbalance.asOf });
+  if (!error) state.trialBalanceRows = data || [];
+}
+async function loadIncomeStatement() {
+  if (!isMgmt()) return;
+  const { from, to } = state.statementDates.incomestatement;
+  const { data, error } = await sb.rpc("income_statement", { p_from: from, p_to: to });
+  if (!error) state.incomeStatementRows = data || [];
+}
+async function loadBalanceSheet() {
+  if (!isMgmt()) return;
+  const asOf = state.statementDates.balancesheet.asOf;
+  const [tb, ni] = await Promise.all([
+    sb.rpc("trial_balance", { p_as_of: asOf }),
+    sb.rpc("net_income_to_date", { p_as_of: asOf }),
+  ]);
+  if (!tb.error) state.balanceSheetRows = tb.data || [];
+  if (!ni.error) state.balanceSheetNetIncome = ni.data || 0;
+}
+async function loadCashFlow() {
+  if (!isMgmt()) return;
+  const { from, to } = state.statementDates.cashflow;
+  const [cf, tbBefore, tbTo] = await Promise.all([
+    sb.rpc("cash_flow_statement", { p_from: from, p_to: to }),
+    sb.rpc("trial_balance", { p_as_of: dayBefore(from) }),
+    sb.rpc("trial_balance", { p_as_of: to }),
+  ]);
+  state.cashFlowRows = cf.error ? [] : (cf.data || []);
+  const sumCash = (rows) => (rows || []).filter((r) => r.code && r.code.startsWith("CASH-"))
+    .reduce((s, r) => s + Number(r.debit || 0) - Number(r.credit || 0), 0);
+  state.cashFlowBeginCash = tbBefore.error ? 0 : sumCash(tbBefore.data);
+  state.cashFlowEndCash = tbTo.error ? 0 : sumCash(tbTo.data);
+}
+async function loadGeneralLedger() {
+  if (!isMgmt() || !state.glQuery.account) { state.glRows = []; return; }
+  const { data, error } = await sb.rpc("general_ledger", {
+    p_account_code: state.glQuery.account,
+    p_from: state.glQuery.from || null,
+    p_to: state.glQuery.to || null,
+  });
+  if (!error) state.glRows = data || [];
+}
+// AR Aging reads each unpaid invoice's own copy of its line items (every
+// invoice gets its tasks copied onto it — parent_type 'Invoice' — the
+// moment it's created, see maybe_finalize_work_order in migration 015) plus
+// its work order's discount/accounting_system, so the total shown here is
+// computed with the exact same taskTotals() formula as everywhere else.
+async function loadARAging() {
+  if (!isMgmt()) return;
+  const { data: invs, error } = await sb.from("invoices").select("*").eq("payment_status", "Unpaid").order("invoice_date");
+  if (error) return;
+  state.arInvoices = invs || [];
+  const ids = state.arInvoices.map((i) => i.id);
+  const woIds = [...new Set(state.arInvoices.map((i) => i.wo_id).filter(Boolean))];
+  const [tasksRes, wosRes] = await Promise.all([
+    ids.length ? sb.from("tasks").select("*").eq("parent_type", "Invoice").in("parent_id", ids) : Promise.resolve({ data: [] }),
+    woIds.length ? sb.from("work_orders").select("id,discount,accounting_system").in("id", woIds) : Promise.resolve({ data: [] }),
+  ]);
+  state.arTasksByInvoice = {};
+  (tasksRes.data || []).forEach((t) => {
+    if (!state.arTasksByInvoice[t.parent_id]) state.arTasksByInvoice[t.parent_id] = [];
+    state.arTasksByInvoice[t.parent_id].push(t);
+  });
+  state.arWoById = {};
+  (wosRes.data || []).forEach((w) => { state.arWoById[w.id] = w; });
+}
+// AP Aging: approved-but-unpaid expenses, plus approved payroll runs not yet
+// paid — there's no formal Accounts Payable accrual in this system (expenses
+// and payroll only post to the ledger at payment time), so this reads the
+// source tables directly rather than a ledger account.
+async function loadAPAging() {
+  if (!isMgmt()) return;
+  const [expRes, prRes] = await Promise.all([
+    sb.from("expenses").select("*").eq("status", "Approved").eq("payment_status", "Unpaid").order("expense_date"),
+    sb.from("payroll_runs").select("*").eq("status", "Approved").order("approved_at"),
+  ]);
+  state.apExpenses = expRes.data || [];
+  state.apPayrollRuns = prRes.data || [];
+  const runIds = state.apPayrollRuns.map((r) => r.id);
+  state.apPayrollNetByRun = {};
+  if (runIds.length) {
+    const { data } = await sb.from("payroll_lines").select("*").in("payroll_run_id", runIds);
+    (data || []).forEach((l) => {
+      state.apPayrollNetByRun[l.payroll_run_id] = (state.apPayrollNetByRun[l.payroll_run_id] || 0) + Number(l.net_pay || 0);
+    });
+  }
+}
 async function loadTasksFor(parentId) {
   const { data, error } = await sb.from("tasks").select("*").eq("parent_id", parentId).order("created_at");
   if (!error) state.tasksByParent[parentId] = data || [];
@@ -229,12 +433,24 @@ async function loadView(view) {
     if (view === "employees") await loadEmployees();
     if (view === "payroll") await Promise.all([loadPayrollRuns(), loadEmployees(), loadBankAccounts()]);
     if (view === "fixedassets") await Promise.all([loadFixedAssets(), loadBankAccounts()]);
-    if (view === "ledger") await Promise.all([loadLedger(), loadBankAccounts()]);
-    // keep expanded rows' task lists (and payroll run lines) fresh
+    if (view === "chartofaccounts") await loadLedger();
+    if (view === "bankaccounts") await Promise.all([loadLedger(), loadBankAccounts()]);
+    if (view === "journalentries") await Promise.all([loadJournalEntries(), loadLedger(), loadBankAccounts(), loadAccountingPeriods()]);
+    if (view === "generalledger") await Promise.all([loadLedger(), loadBankAccounts(), loadGeneralLedger()]);
+    if (view === "trialbalance") await loadTrialBalance();
+    if (view === "incomestatement") await loadIncomeStatement();
+    if (view === "balancesheet") await loadBalanceSheet();
+    if (view === "cashflow") await loadCashFlow();
+    if (view === "araging") await loadARAging();
+    if (view === "apaging") await loadAPAging();
+    if (view === "periodclose") await loadAccountingPeriods();
+    // keep expanded rows' task lists (journal-entry lines, payroll run lines) fresh
     const openParents = Object.keys(state.expanded).filter((k) => state.expanded[k]);
     await Promise.all(openParents.map((k) => {
       const [table, id] = k.split(":");
-      return table === "payroll" ? loadPayrollLines(id) : loadTasksFor(id);
+      if (table === "payroll") return loadPayrollLines(id);
+      if (table === "journalentries") return loadJournalLines(id);
+      return loadTasksFor(id);
     }));
   } finally {
     state.loading = false;
@@ -251,7 +467,8 @@ function scheduleRefresh() {
 }
 function setupRealtime() {
   const tables = ["customers", "inquiries", "quotations", "work_orders", "tasks", "invoices", "bank_accounts",
-    "journal_entries", "expenses", "employees", "payroll_runs", "payroll_lines", "fixed_assets"];
+    "journal_entries", "journal_lines", "chart_of_accounts", "accounting_periods",
+    "expenses", "employees", "payroll_runs", "payroll_lines", "fixed_assets"];
   const channel = sb.channel("us-servtech-live");
   tables.forEach((t) => {
     channel.on("postgres_changes", { event: "*", schema: "public", table: t }, scheduleRefresh);
@@ -306,7 +523,15 @@ App.logout = async function () {
 
 App.nav = function (view) {
   state.view = view;
+  state.module = moduleForView(view);
   loadView(view);
+};
+// Switching module jumps to that module's first tab. Finance is refused for
+// anyone but Owner/Manager here too — belt and braces on top of the RLS
+// that already blocks every finance table for an Officer.
+App.switchModule = function (mid) {
+  if (mid === "finance" && !isMgmt()) return;
+  App.nav(MODULES[mid].tabs[0].id);
 };
 App.toggle = function (table, id) {
   const key = table + ":" + id;
@@ -314,11 +539,20 @@ App.toggle = function (table, id) {
   if (state.expanded[key]) {
     if (table === "payroll") {
       if (!state.payrollLinesByRun[id]) loadPayrollLines(id).then(render);
+    } else if (table === "journalentries") {
+      if (!state.journalLinesByJe[id]) loadJournalLines(id).then(render);
     } else if (!state.tasksByParent[id]) {
       loadTasksFor(id).then(render);
     }
   }
   render();
+};
+// Jump straight to an account's General Ledger drill-down from wherever
+// it's shown (Chart of Accounts, Bank Accounts) — code is either a real
+// COA code or a synthetic CASH-<bank_id> one, general_ledger() handles both.
+App.viewAccountLedger = function (code) {
+  state.glQuery = { account: code, from: "", to: "" };
+  App.nav("generalledger");
 };
 
 // ------------------------------------------------------------ customers
@@ -727,12 +961,163 @@ App.addBankAccount = async function (ev) {
   return false;
 };
 
+// ------------------------------------------------------------ chart of accounts
+//
+// The database itself only lets the Owner insert or rename an account
+// (chart_of_accounts_owner_write / _owner_update policies) — a Manager can
+// read balances but not restructure the chart. This form is hidden from a
+// Manager for the same reason; if it weren't, the insert would just fail.
+
+App.addChartAccount = async function (ev) {
+  ev.preventDefault();
+  const v = fd(ev.target);
+  if (!v.code || !v.code.trim()) { showToast("Account code is required", true); return false; }
+  if (!v.name || !v.name.trim()) { showToast("Account name is required", true); return false; }
+  if (!v.account_type) { showToast("Pick an account type", true); return false; }
+  await guard(sb.from("chart_of_accounts").insert({
+    code: v.code.trim(), name: v.name.trim(), account_type: v.account_type,
+  }), "Account added");
+  ev.target.reset();
+  await loadLedger();
+  render();
+  return false;
+};
+
+// ------------------------------------------------------------ journal entries
+//
+// The one place this app writes a journal entry by hand — everything else
+// (revenue, payments, expense/payroll payouts, asset purchases,
+// depreciation) posts itself via server-side triggers. Same state-bound
+// draft pattern as the Inquiry form (see freshInquiryDraft above): plain
+// typing never re-renders, it just patches the totals line directly, so a
+// realtime refresh landing mid-type can't wipe an unfinished entry.
+
+function freshJeDraft() {
+  return {
+    je_date: new Date().toISOString().slice(0, 10),
+    memo: "",
+    lines: [
+      { account_code: "", debit: "", credit: "" },
+      { account_code: "", debit: "", credit: "" },
+    ],
+  };
+}
+function jeDraftTotals() {
+  const lines = state.jeDraft.lines;
+  const debit = lines.reduce((s, l) => s + Number(l.debit || 0), 0);
+  const credit = lines.reduce((s, l) => s + Number(l.credit || 0), 0);
+  return { debit, credit, balanced: debit > 0 && Math.abs(debit - credit) < 0.005 };
+}
+function updateJeDraftTotals() {
+  const el = document.getElementById("jeDraftTotals");
+  if (!el) return;
+  const t = jeDraftTotals();
+  el.innerHTML = `Total debit: <b>${fmtMoney(t.debit)}</b> &nbsp; Total credit: <b>${fmtMoney(t.credit)}</b> &nbsp;
+    <span class="balance-flag ${t.balanced ? "ok" : "bad"}">${t.balanced ? "Balanced" : "Not balanced"}</span>`;
+}
+App.setJeField = function (field, value) {
+  state.jeDraft[field] = value;
+};
+App.setJeLineField = function (idx, field, value) {
+  state.jeDraft.lines[idx][field] = value;
+  updateJeDraftTotals();
+};
+App.addJeLineRow = function () {
+  state.jeDraft.lines.push({ account_code: "", debit: "", credit: "" });
+  render();
+};
+App.removeJeLineRow = function (idx) {
+  state.jeDraft.lines.splice(idx, 1);
+  if (state.jeDraft.lines.length < 2) state.jeDraft.lines.push({ account_code: "", debit: "", credit: "" });
+  render();
+};
+App.postJournalEntry = async function (ev) {
+  ev.preventDefault();
+  const d = state.jeDraft;
+  const lines = d.lines.filter((l) => l.account_code && (Number(l.debit || 0) > 0 || Number(l.credit || 0) > 0));
+  if (lines.length < 2) { showToast("A journal entry needs at least two lines", true); return false; }
+  const debit = lines.reduce((s, l) => s + Number(l.debit || 0), 0);
+  const credit = lines.reduce((s, l) => s + Number(l.credit || 0), 0);
+  if (Math.abs(debit - credit) >= 0.005) { showToast("Debits and credits must balance", true); return false; }
+  if (!d.memo || !d.memo.trim()) { showToast("Enter a memo describing this entry", true); return false; }
+  await guard(sb.rpc("post_manual_journal_entry", {
+    p_je_date: d.je_date || new Date().toISOString().slice(0, 10),
+    p_memo: d.memo.trim(),
+    p_lines: lines.map((l) => ({ account_code: l.account_code, debit: Number(l.debit || 0), credit: Number(l.credit || 0) })),
+  }), "Journal entry posted");
+  state.jeDraft = freshJeDraft();
+  await Promise.all([loadJournalEntries(), loadLedger()]);
+  render();
+  return false;
+};
+
+// ------------------------------------------------------------ general ledger
+
+App.setGlAccount = function (value) {
+  state.glQuery.account = value;
+};
+App.setGlField = function (field, value) {
+  state.glQuery[field] = value;
+};
+App.runGlQuery = async function (ev) {
+  ev.preventDefault();
+  await loadGeneralLedger();
+  render();
+  return false;
+};
+
+// -------------------------------------------------------- financial statements
+
+App.setStatementDate = function (stmt, field, value) {
+  state.statementDates[stmt][field] = value;
+};
+App.runStatement = async function (stmt, ev) {
+  ev.preventDefault();
+  if (stmt === "trialbalance") await loadTrialBalance();
+  if (stmt === "incomestatement") await loadIncomeStatement();
+  if (stmt === "balancesheet") await loadBalanceSheet();
+  if (stmt === "cashflow") await loadCashFlow();
+  render();
+  return false;
+};
+
+// ------------------------------------------------------------- period close
+
+App.setPeriodField = function (field, value) {
+  state.periodDraft[field] = value;
+};
+App.createPeriod = async function (ev) {
+  ev.preventDefault();
+  const pd = state.periodDraft;
+  if (!pd.period_label.trim() || !pd.start_date || !pd.end_date) { showToast("Fill in a label, start date and end date", true); return false; }
+  if (pd.end_date < pd.start_date) { showToast("End date must be on or after the start date", true); return false; }
+  await guard(sb.from("accounting_periods").insert({
+    period_label: pd.period_label.trim(), start_date: pd.start_date, end_date: pd.end_date,
+  }), "Period created");
+  state.periodDraft = { period_label: "", start_date: "", end_date: "" };
+  await loadAccountingPeriods();
+  render();
+  return false;
+};
+App.closePeriodAction = async function (id) {
+  if (!confirm("Close this period? No new or edited posting dated inside it will be allowed for anyone — including automated postings — until it's reopened.")) return;
+  await guard(sb.rpc("close_accounting_period", { p_period_id: id }), "Period closed");
+  await loadAccountingPeriods();
+  render();
+};
+App.reopenPeriodAction = async function (id) {
+  await guard(sb.rpc("reopen_accounting_period", { p_period_id: id }), "Period reopened");
+  await loadAccountingPeriods();
+  render();
+};
+
 // ====================================================================
 // RENDER
 // ====================================================================
 
 function render() {
   const app = document.getElementById("app");
+  document.documentElement.dataset.module = state.module || "operations";
   if (state.loading && !state.profile && !state.session) { app.innerHTML = `<div class="empty-state">Loading…</div>`; return; }
   if (!state.session) { app.innerHTML = renderLogin(); return; }
   if (!state.profile) { app.innerHTML = `<div class="empty-state">Loading your profile…</div>`; return; }
@@ -740,12 +1125,16 @@ function render() {
   app.innerHTML = renderShell();
 }
 
+// Placeholder monogram badge — see .logo-badge in index.html. Swap for the
+// company's actual logo file the moment it arrives; nothing else changes.
+const LOGO_MARK = `<span class="logo-badge">UST</span>`;
+
 function renderLogin() {
   return `
   <div class="login-wrap">
     <div class="login-card">
-      <h1>US ServTech</h1>
-      <p class="sub">Operations &amp; Accounts — sign in with your company login.</p>
+      <div class="login-brand">${LOGO_MARK}<h1>US ServTech</h1></div>
+      <p class="sub">Operations &amp; Finance — sign in with your company login.</p>
       <form onsubmit="return App.login(event)">
         <div class="field"><label>Email</label><input type="email" name="email" required autocomplete="username"></div>
         <div class="field"><label>Password</label><input type="password" name="password" required autocomplete="current-password"></div>
@@ -766,17 +1155,24 @@ function renderDisabled() {
   </div>`;
 }
 function renderShell() {
-  const navHtml = NAV.filter((n) => !n.mgmtOnly || isMgmt()).map((n) =>
-    `<button class="${state.view === n.id ? "active" : ""}" onclick="App.nav('${n.id}')">${n.label}</button>`
+  const mod = state.module;
+  const showFinance = isMgmt();
+  const moduleBtns = `
+    <button class="mod-operations ${mod === "operations" ? "active" : ""}" onclick="App.switchModule('operations')">Operations</button>
+    ${showFinance ? `<button class="mod-finance ${mod === "finance" ? "active" : ""}" onclick="App.switchModule('finance')">Finance</button>` : ""}`;
+  const tabs = MODULES[mod] ? MODULES[mod].tabs : MODULES.operations.tabs;
+  const subnavHtml = tabs.map((t) =>
+    `<button class="${state.view === t.id ? "active" : ""}" onclick="App.nav('${t.id}')">${t.label}</button>`
   ).join("");
   return `
   <div class="topbar">
-    <div class="brand">US ServTech</div>
-    <nav>${navHtml}</nav>
+    <div class="brand">${LOGO_MARK}<span>US ServTech<span class="tag">Operations &amp; Finance</span></span></div>
+    <div class="module-switch">${moduleBtns}</div>
     <div class="who"><b>${esc(state.profile.name || state.session.user.email)}</b> · ${esc(state.profile.role)}
       <button class="btn btn-ghost btn-sm" onclick="App.logout()">Sign out</button>
     </div>
   </div>
+  <div class="subnav">${subnavHtml}</div>
   <main>${state.loading ? `<div class="empty-state">Loading…</div>` : renderView()}</main>
   <div id="toastHost">${toastHtml()}</div>`;
 }
@@ -792,7 +1188,17 @@ function renderView() {
     case "employees": return isMgmt() ? renderEmployees() : mgmtOnlyView();
     case "payroll": return isMgmt() ? renderPayroll() : mgmtOnlyView();
     case "fixedassets": return isMgmt() ? renderFixedAssets() : mgmtOnlyView();
-    case "ledger": return isMgmt() ? renderLedger() : mgmtOnlyView();
+    case "chartofaccounts": return isMgmt() ? renderChartOfAccounts() : mgmtOnlyView();
+    case "bankaccounts": return isMgmt() ? renderBankAccounts() : mgmtOnlyView();
+    case "journalentries": return isMgmt() ? renderJournalEntries() : mgmtOnlyView();
+    case "generalledger": return isMgmt() ? renderGeneralLedger() : mgmtOnlyView();
+    case "trialbalance": return isMgmt() ? renderTrialBalance() : mgmtOnlyView();
+    case "incomestatement": return isMgmt() ? renderIncomeStatement() : mgmtOnlyView();
+    case "balancesheet": return isMgmt() ? renderBalanceSheet() : mgmtOnlyView();
+    case "cashflow": return isMgmt() ? renderCashFlow() : mgmtOnlyView();
+    case "araging": return isMgmt() ? renderARAging() : mgmtOnlyView();
+    case "apaging": return isMgmt() ? renderAPAging() : mgmtOnlyView();
+    case "periodclose": return isMgmt() ? renderPeriodClose() : mgmtOnlyView();
     default: return "";
   }
 }
@@ -821,7 +1227,7 @@ function renderDashboard() {
     <h3>Where to go next</h3>
     <p class="subtle">New business starts on <b>Inquiries</b>. Convert an inquiry to a <b>Quotation</b> or straight to a <b>Work Order</b>.
     Mark line items Delivered on a work order and its invoice and revenue posting happen automatically.
-    Payments are recorded on <b>Invoices</b>.${isMgmt() ? " Account and bank balances are on <b>Ledger</b>." : ""}</p>
+    Payments are recorded on <b>Invoices</b>.${isMgmt() ? " Switch to the <b>Finance</b> module above for the chart of accounts, journal entries and every financial statement." : ""}</p>
   </div>`;
 }
 
@@ -1362,21 +1768,60 @@ function renderFixedAssets() {
   </div>`;
 }
 
-// ---------------------------------------------------------- Ledger
+// ---------------------------------------------------------- Chart of Accounts
 
-function renderLedger() {
+function renderChartOfAccounts() {
+  const owner = isOwner();
   return `
-  <h2 class="page-title">Ledger</h2>
-  <p class="page-sub">Balances update live as work orders, expenses, payroll and asset purchases are recorded — nothing here is posted by hand.</p>
+  <h2 class="page-title">Chart of Accounts</h2>
+  <p class="page-sub">Every account everything else in Finance posts against. Balances are live, as of right now.${owner ? "" : " Only the Owner can add or rename accounts."}</p>
+  ${owner ? `
   <div class="card">
-    <h3>Bank accounts</h3>
+    <h3>Add account</h3>
+    <form onsubmit="return App.addChartAccount(event)">
+      <div class="form-row">
+        <div class="field"><label>Code</label><input name="code" placeholder="e.g. 2300" required></div>
+        <div class="field"><label>Name</label><input name="name" required></div>
+        <div class="field"><label>Type</label>
+          <select name="account_type" required>
+            <option value="">— pick —</option>
+            ${["Asset", "ContraAsset", "Liability", "Equity", "ContraEquity", "Revenue", "Expense"].map((t) => `<option value="${t}">${t}</option>`).join("")}
+          </select>
+        </div>
+        <div class="field" style="flex:0"><label>&nbsp;</label><button class="btn btn-primary" type="submit">Add</button></div>
+      </div>
+    </form>
+  </div>` : ""}
+  <div class="card">
     <table>
-      <thead><tr><th>Account</th><th>Type</th><th>Number</th><th class="right">Current balance (SAR)</th></tr></thead>
+      <thead><tr><th>Code</th><th>Account</th><th>Type</th><th class="right">Balance (SAR)</th><th></th></tr></thead>
+      <tbody>
+        ${state.accountBalances.length ? state.accountBalances.slice().sort((a, b) => a.code.localeCompare(b.code)).map((a) => `
+          <tr>
+            <td>${esc(a.code)}</td><td>${esc(a.name)}</td><td>${esc(a.account_type)}</td>
+            <td class="right">${fmtMoney(a.balance)}</td>
+            <td><button class="link-btn" onclick="App.viewAccountLedger('${a.code}')">view ledger</button></td>
+          </tr>`).join("") : `<tr><td colspan="5" class="empty-state">No accounts yet.</td></tr>`}
+      </tbody>
+    </table>
+  </div>`;
+}
+
+// ---------------------------------------------------------- Bank Accounts
+
+function renderBankAccounts() {
+  return `
+  <h2 class="page-title">Bank Accounts</h2>
+  <p class="page-sub">Cash balances update live as invoices are paid, and as expenses, payroll and asset purchases are paid out.</p>
+  <div class="card">
+    <table>
+      <thead><tr><th>Account</th><th>Type</th><th>Number</th><th class="right">Current balance (SAR)</th><th></th></tr></thead>
       <tbody>
         ${state.bankBalances.length ? state.bankBalances.map((b) => {
           const acc = state.bankAccounts.find((x) => x.id === b.id) || {};
-          return `<tr><td>${esc(b.name)}</td><td>${esc(acc.account_type)}</td><td>${esc(acc.account_number)}</td><td class="right">${fmtMoney(b.current_balance)}</td></tr>`;
-        }).join("") : `<tr><td colspan="4" class="empty-state">No bank accounts yet.</td></tr>`}
+          return `<tr><td>${esc(b.name)}</td><td>${esc(acc.account_type)}</td><td>${esc(acc.account_number)}</td><td class="right">${fmtMoney(b.current_balance)}</td>
+            <td><button class="link-btn" onclick="App.viewAccountLedger('CASH-${b.id}')">view ledger</button></td></tr>`;
+        }).join("") : `<tr><td colspan="5" class="empty-state">No bank accounts yet.</td></tr>`}
       </tbody>
     </table>
     <form class="form-row" style="margin-top:14px" onsubmit="return App.addBankAccount(event)">
@@ -1386,15 +1831,347 @@ function renderLedger() {
       <div class="field"><label>Opening balance (SAR)</label><input name="opening_balance" type="number" step="0.01" value="0"></div>
       <div class="field" style="flex:0"><label>&nbsp;</label><button class="btn btn-ghost btn-sm" type="submit">Add</button></div>
     </form>
+  </div>`;
+}
+
+// ---------------------------------------------------------- Journal Entries
+
+function renderJournalEntries() {
+  if (!state.jeDraft) state.jeDraft = freshJeDraft();
+  const d = state.jeDraft;
+  const t = jeDraftTotals();
+  return `
+  <h2 class="page-title">Journal Entries</h2>
+  <p class="page-sub">Manual entries for anything that doesn't post itself — corrections, accruals, opening balances. Every entry must balance before it posts, and can't be dated inside a closed period.</p>
+  <div class="card">
+    <h3>New journal entry</h3>
+    <form onsubmit="return App.postJournalEntry(event)">
+      <div class="form-row">
+        <div class="field"><label>Date</label><input type="date" value="${esc(d.je_date)}" oninput="App.setJeField('je_date',this.value)"></div>
+        <div class="field" style="flex:3"><label>Memo</label><input value="${esc(d.memo)}" oninput="App.setJeField('memo',this.value)" placeholder="What is this entry for?"></div>
+      </div>
+      <table style="margin-top:12px">
+        <thead><tr><th>Account</th><th class="right">Debit (SAR)</th><th class="right">Credit (SAR)</th><th></th></tr></thead>
+        <tbody>
+          ${d.lines.map((l, idx) => `
+          <tr>
+            <td><select onchange="App.setJeLineField(${idx},'account_code',this.value)">${glAccountOptions(l.account_code)}</select></td>
+            <td class="right"><input type="number" step="0.01" min="0" style="width:120px" value="${esc(l.debit)}" oninput="App.setJeLineField(${idx},'debit',this.value)"></td>
+            <td class="right"><input type="number" step="0.01" min="0" style="width:120px" value="${esc(l.credit)}" oninput="App.setJeLineField(${idx},'credit',this.value)"></td>
+            <td>${d.lines.length > 2 ? `<button type="button" class="link-btn" onclick="App.removeJeLineRow(${idx})">remove</button>` : ""}</td>
+          </tr>`).join("")}
+        </tbody>
+      </table>
+      <button type="button" class="btn btn-ghost btn-sm" style="margin-top:8px" onclick="App.addJeLineRow()">+ Add another line</button>
+      <div class="form-row" style="margin-top:14px">
+        <div class="field" style="flex:0"><label>&nbsp;</label><button class="btn btn-primary" type="submit">Post entry</button></div>
+      </div>
+      <div class="totals-line" id="jeDraftTotals">Total debit: <b>${fmtMoney(t.debit)}</b> &nbsp; Total credit: <b>${fmtMoney(t.credit)}</b> &nbsp;
+        <span class="balance-flag ${t.balanced ? "ok" : "bad"}">${t.balanced ? "Balanced" : "Not balanced"}</span></div>
+    </form>
   </div>
   <div class="card">
-    <h3>Chart of accounts — balances</h3>
     <table>
-      <thead><tr><th>Code</th><th>Account</th><th>Type</th><th class="right">Balance (SAR)</th></tr></thead>
+      <thead><tr><th>No.</th><th>Date</th><th>Memo</th><th>Source</th><th></th></tr></thead>
       <tbody>
-        ${state.accountBalances.length ? state.accountBalances.map((a) => `
-          <tr><td>${esc(a.code)}</td><td>${esc(a.name)}</td><td>${esc(a.account_type)}</td><td class="right">${fmtMoney(a.balance)}</td></tr>
-        `).join("") : `<tr><td colspan="4" class="empty-state">No activity posted yet.</td></tr>`}
+        ${state.journalEntries.length ? state.journalEntries.map((je) => {
+          const key = "journalentries:" + je.id;
+          const open = !!state.expanded[key];
+          const lines = state.journalLinesByJe[je.id] || [];
+          return `
+          <tr class="clickable" onclick="App.toggle('journalentries','${je.id}')">
+            <td>${esc(je.je_number)}</td><td>${fmtDate(je.je_date)}</td><td>${esc(je.memo)}</td>
+            <td>${je.source === "manual" ? pill("Manual", "pending") : esc(je.source)}</td>
+            <td><button class="link-btn" onclick="event.stopPropagation();App.toggle('journalentries','${je.id}')">${open ? "close" : "view lines"}</button></td>
+          </tr>
+          ${open ? `<tr><td colspan="5"><div class="wo-detail">
+            <table>
+              <thead><tr><th>Account</th><th class="right">Debit</th><th class="right">Credit</th></tr></thead>
+              <tbody>
+                ${lines.length ? lines.map((l) => `<tr><td>${esc(l.account_code)}</td><td class="right">${fmtMoney(l.debit)}</td><td class="right">${fmtMoney(l.credit)}</td></tr>`).join("") : `<tr><td colspan="3" class="empty-state">Loading…</td></tr>`}
+              </tbody>
+            </table>
+          </div></td></tr>` : ""}`;
+        }).join("") : `<tr><td colspan="5" class="empty-state">No journal entries yet.</td></tr>`}
+      </tbody>
+    </table>
+  </div>`;
+}
+
+// ---------------------------------------------------------- General Ledger
+
+function renderGeneralLedger() {
+  const q = state.glQuery;
+  return `
+  <h2 class="page-title">General Ledger</h2>
+  <p class="page-sub">Pick an account to see every entry posted to it, with a running balance.</p>
+  <div class="card">
+    <form class="form-row" onsubmit="return App.runGlQuery(event)">
+      <div class="field"><label>Account</label><select onchange="App.setGlAccount(this.value)">${glAccountOptions(q.account)}</select></div>
+      <div class="field"><label>From</label><input type="date" value="${esc(q.from)}" oninput="App.setGlField('from',this.value)"></div>
+      <div class="field"><label>To</label><input type="date" value="${esc(q.to)}" oninput="App.setGlField('to',this.value)"></div>
+      <div class="field" style="flex:0"><label>&nbsp;</label><button class="btn btn-ghost btn-sm" type="submit">Filter</button></div>
+    </form>
+  </div>
+  <div class="card">
+    ${!q.account ? `<div class="empty-state">Pick an account above.</div>` : `
+    <table>
+      <thead><tr><th>No.</th><th>Date</th><th>Memo</th><th>Source</th><th class="right">Debit</th><th class="right">Credit</th><th class="right">Balance</th></tr></thead>
+      <tbody>
+        ${state.glRows.length ? state.glRows.map((r) => `
+          <tr><td>${esc(r.je_number)}</td><td>${fmtDate(r.je_date)}</td><td>${esc(r.memo)}</td><td>${esc(r.source)}</td>
+          <td class="right">${Number(r.debit) ? fmtMoney(r.debit) : "—"}</td><td class="right">${Number(r.credit) ? fmtMoney(r.credit) : "—"}</td>
+          <td class="right">${fmtMoney(r.running_balance)}</td></tr>
+        `).join("") : `<tr><td colspan="7" class="empty-state">No activity on this account${q.from || q.to ? " in this range" : ""}.</td></tr>`}
+      </tbody>
+    </table>`}
+  </div>`;
+}
+
+// -------------------------------------------------------------- Trial Balance
+
+function renderTrialBalance() {
+  const asOf = state.statementDates.trialbalance.asOf;
+  const rows = state.trialBalanceRows;
+  const totalDebit = rows.reduce((s, r) => s + Number(r.debit || 0), 0);
+  const totalCredit = rows.reduce((s, r) => s + Number(r.credit || 0), 0);
+  const balanced = Math.abs(totalDebit - totalCredit) < 0.01;
+  return `
+  <h2 class="page-title">Trial Balance</h2>
+  <div class="card">
+    <form class="statement-meta" onsubmit="return App.runStatement('trialbalance',event)">
+      <div class="field"><label>As of</label><input type="date" value="${esc(asOf)}" oninput="App.setStatementDate('trialbalance','asOf',this.value)"></div>
+      <div class="field" style="flex:0"><button class="btn btn-ghost btn-sm" type="submit">Run</button></div>
+    </form>
+    <div class="statement-head"><div class="co">US ServTech</div><div class="title">Trial Balance</div><div class="period">As of ${fmtDate(asOf)}</div></div>
+    <table>
+      <thead><tr><th>Code</th><th>Account</th><th>Type</th><th class="right">Debit</th><th class="right">Credit</th></tr></thead>
+      <tbody>
+        ${rows.length ? rows.map((r) => `<tr><td>${esc(r.code)}</td><td>${esc(r.name)}</td><td>${esc(r.account_type)}</td>
+          <td class="right">${Number(r.debit) ? fmtMoney(r.debit) : "—"}</td><td class="right">${Number(r.credit) ? fmtMoney(r.credit) : "—"}</td></tr>`).join("")
+          : `<tr><td colspan="5" class="empty-state">No activity as of this date.</td></tr>`}
+        <tr class="total-row"><td colspan="3">Total</td><td class="right">${fmtMoney(totalDebit)}</td><td class="right">${fmtMoney(totalCredit)}</td></tr>
+      </tbody>
+    </table>
+    <div style="margin-top:10px"><span class="balance-flag ${balanced ? "ok" : "bad"}">${balanced ? "Balanced" : "Out of balance — check recent postings"}</span></div>
+  </div>`;
+}
+
+// ---------------------------------------------------------- Income Statement
+
+function renderIncomeStatement() {
+  const { from, to } = state.statementDates.incomestatement;
+  const rows = state.incomeStatementRows;
+  const revenue = rows.filter((r) => r.account_type === "Revenue");
+  const expense = rows.filter((r) => r.account_type === "Expense");
+  const totalRevenue = revenue.reduce((s, r) => s + Number(r.amount || 0), 0);
+  const totalExpense = expense.reduce((s, r) => s + Number(r.amount || 0), 0);
+  const netIncome = totalRevenue - totalExpense;
+  return `
+  <h2 class="page-title">Income Statement</h2>
+  <div class="card">
+    <form class="statement-meta" onsubmit="return App.runStatement('incomestatement',event)">
+      <div class="field"><label>From</label><input type="date" value="${esc(from)}" oninput="App.setStatementDate('incomestatement','from',this.value)"></div>
+      <div class="field"><label>To</label><input type="date" value="${esc(to)}" oninput="App.setStatementDate('incomestatement','to',this.value)"></div>
+      <div class="field" style="flex:0"><button class="btn btn-ghost btn-sm" type="submit">Run</button></div>
+    </form>
+    <div class="statement-head"><div class="co">US ServTech</div><div class="title">Income Statement</div><div class="period">${fmtDate(from)} – ${fmtDate(to)}</div></div>
+    <table>
+      <thead><tr><th colspan="2">Revenue</th></tr></thead>
+      <tbody>
+        ${revenue.length ? revenue.map((r) => `<tr><td class="indent">${esc(r.name)}</td><td class="right">${fmtMoney(r.amount)}</td></tr>`).join("") : `<tr><td class="indent empty-state" colspan="2">No revenue in this period.</td></tr>`}
+        <tr class="subtotal-row"><td>Total revenue</td><td class="right">${fmtMoney(totalRevenue)}</td></tr>
+      </tbody>
+      <thead><tr><th colspan="2">Expenses</th></tr></thead>
+      <tbody>
+        ${expense.length ? expense.map((r) => `<tr><td class="indent">${esc(r.name)}</td><td class="right">${fmtMoney(r.amount)}</td></tr>`).join("") : `<tr><td class="indent empty-state" colspan="2">No expenses in this period.</td></tr>`}
+        <tr class="subtotal-row"><td>Total expenses</td><td class="right">${fmtMoney(totalExpense)}</td></tr>
+      </tbody>
+      <tbody><tr class="total-row"><td>Net income</td><td class="right">${fmtMoney(netIncome)}</td></tr></tbody>
+    </table>
+  </div>`;
+}
+
+// ------------------------------------------------------------- Balance Sheet
+
+function renderBalanceSheet() {
+  const asOf = state.statementDates.balancesheet.asOf;
+  const rows = state.balanceSheetRows;
+  const assets = rows.filter((r) => r.account_type === "Asset" || r.account_type === "ContraAsset");
+  const liabilities = rows.filter((r) => r.account_type === "Liability");
+  const equity = rows.filter((r) => (r.account_type === "Equity" || r.account_type === "ContraEquity") && r.code !== "3100");
+  const assetAmt = (r) => r.account_type === "ContraAsset" ? -(Number(r.credit || 0) - Number(r.debit || 0)) : Number(r.debit || 0) - Number(r.credit || 0);
+  const creditAmt = (r) => Number(r.credit || 0) - Number(r.debit || 0);
+  const totalAssets = assets.reduce((s, r) => s + assetAmt(r), 0);
+  const totalLiabilities = liabilities.reduce((s, r) => s + creditAmt(r), 0);
+  const equityFromAccounts = equity.reduce((s, r) => s + creditAmt(r), 0);
+  const netIncome = Number(state.balanceSheetNetIncome || 0);
+  const totalEquity = equityFromAccounts + netIncome;
+  const balanced = Math.abs(totalAssets - (totalLiabilities + totalEquity)) < 0.01;
+  return `
+  <h2 class="page-title">Balance Sheet</h2>
+  <div class="card">
+    <form class="statement-meta" onsubmit="return App.runStatement('balancesheet',event)">
+      <div class="field"><label>As of</label><input type="date" value="${esc(asOf)}" oninput="App.setStatementDate('balancesheet','asOf',this.value)"></div>
+      <div class="field" style="flex:0"><button class="btn btn-ghost btn-sm" type="submit">Run</button></div>
+    </form>
+    <div class="statement-head"><div class="co">US ServTech</div><div class="title">Balance Sheet</div><div class="period">As of ${fmtDate(asOf)}</div></div>
+    <table>
+      <thead><tr><th colspan="2">Assets</th></tr></thead>
+      <tbody>
+        ${assets.length ? assets.map((r) => `<tr><td class="indent">${esc(r.name)}</td><td class="right">${assetAmt(r) < 0 ? "(" + fmtMoney(-assetAmt(r)) + ")" : fmtMoney(assetAmt(r))}</td></tr>`).join("") : `<tr><td class="indent empty-state" colspan="2">No asset activity.</td></tr>`}
+        <tr class="subtotal-row"><td>Total assets</td><td class="right">${fmtMoney(totalAssets)}</td></tr>
+      </tbody>
+      <thead><tr><th colspan="2">Liabilities</th></tr></thead>
+      <tbody>
+        ${liabilities.length ? liabilities.map((r) => `<tr><td class="indent">${esc(r.name)}</td><td class="right">${fmtMoney(creditAmt(r))}</td></tr>`).join("") : `<tr><td class="indent empty-state" colspan="2">No liabilities.</td></tr>`}
+        <tr class="subtotal-row"><td>Total liabilities</td><td class="right">${fmtMoney(totalLiabilities)}</td></tr>
+      </tbody>
+      <thead><tr><th colspan="2">Equity</th></tr></thead>
+      <tbody>
+        ${equity.map((r) => `<tr><td class="indent">${esc(r.name)}</td><td class="right">${fmtMoney(creditAmt(r))}</td></tr>`).join("")}
+        <tr><td class="indent">Retained earnings (cumulative net income)</td><td class="right">${fmtMoney(netIncome)}</td></tr>
+        <tr class="subtotal-row"><td>Total equity</td><td class="right">${fmtMoney(totalEquity)}</td></tr>
+      </tbody>
+      <tbody><tr class="total-row"><td>Total liabilities &amp; equity</td><td class="right">${fmtMoney(totalLiabilities + totalEquity)}</td></tr></tbody>
+    </table>
+    <div style="margin-top:10px"><span class="balance-flag ${balanced ? "ok" : "bad"}">${balanced ? "Balanced" : "Out of balance"}</span>
+      <span class="subtle" style="margin-left:8px">Retained earnings is computed from all-time net income since there's no year-end closing step — see Income Statement for the breakdown.</span>
+    </div>
+  </div>`;
+}
+
+// ---------------------------------------------------------- Cash Flow Statement
+
+function renderCashFlow() {
+  const { from, to } = state.statementDates.cashflow;
+  const rows = state.cashFlowRows;
+  const byCategory = { Operating: [], Investing: [], Financing: [] };
+  rows.forEach((r) => { (byCategory[r.category] || (byCategory[r.category] = [])).push(r); });
+  const catTotal = (cat) => (byCategory[cat] || []).reduce((s, r) => s + Number(r.amount || 0), 0);
+  const netChange = ["Operating", "Investing", "Financing"].reduce((s, c) => s + catTotal(c), 0);
+  const begin = Number(state.cashFlowBeginCash || 0), end = Number(state.cashFlowEndCash || 0);
+  const reconciles = Math.abs((begin + netChange) - end) < 0.01;
+  const section = (cat, label) => `
+    <thead><tr><th colspan="3">${label}</th></tr></thead>
+    <tbody>
+      ${(byCategory[cat] || []).length ? byCategory[cat].map((r) => `<tr><td class="indent">${esc(r.memo)}</td><td>${fmtDate(r.je_date)}</td><td class="right">${fmtMoney(r.amount)}</td></tr>`).join("")
+        : `<tr><td class="indent empty-state" colspan="3">No ${label.toLowerCase()} activity.</td></tr>`}
+      <tr class="subtotal-row"><td colspan="2">Net cash from ${label.toLowerCase()}</td><td class="right">${fmtMoney(catTotal(cat))}</td></tr>
+    </tbody>`;
+  return `
+  <h2 class="page-title">Cash Flow Statement</h2>
+  <div class="card">
+    <form class="statement-meta" onsubmit="return App.runStatement('cashflow',event)">
+      <div class="field"><label>From</label><input type="date" value="${esc(from)}" oninput="App.setStatementDate('cashflow','from',this.value)"></div>
+      <div class="field"><label>To</label><input type="date" value="${esc(to)}" oninput="App.setStatementDate('cashflow','to',this.value)"></div>
+      <div class="field" style="flex:0"><button class="btn btn-ghost btn-sm" type="submit">Run</button></div>
+    </form>
+    <div class="statement-head"><div class="co">US ServTech</div><div class="title">Cash Flow Statement — Direct Method</div><div class="period">${fmtDate(from)} – ${fmtDate(to)}</div></div>
+    <table>
+      ${section("Operating", "Operating activities")}
+      ${section("Investing", "Investing activities")}
+      ${section("Financing", "Financing activities")}
+      <tbody>
+        <tr class="total-row"><td colspan="2">Net change in cash</td><td class="right">${fmtMoney(netChange)}</td></tr>
+        <tr><td colspan="2">Cash at start of period</td><td class="right">${fmtMoney(begin)}</td></tr>
+        <tr class="total-row"><td colspan="2">Cash at end of period</td><td class="right">${fmtMoney(end)}</td></tr>
+      </tbody>
+    </table>
+    <div style="margin-top:10px"><span class="balance-flag ${reconciles ? "ok" : "bad"}">${reconciles ? "Reconciles" : "Does not reconcile — check for postings outside this range"}</span></div>
+  </div>`;
+}
+
+// -------------------------------------------------------------------- AR Aging
+
+function renderARAging() {
+  const rowsData = state.arInvoices.map((inv) => {
+    const wo = state.arWoById[inv.wo_id] || {};
+    const tasks = state.arTasksByInvoice[inv.id] || [];
+    const total = taskTotals(tasks, wo.discount, wo.accounting_system).total;
+    return { inv, total, bucket: agingBucket(inv.invoice_date) };
+  });
+  const bucketTotal = (b) => rowsData.filter((r) => r.bucket === b).reduce((s, r) => s + r.total, 0);
+  const grandTotal = rowsData.reduce((s, r) => s + r.total, 0);
+  return `
+  <h2 class="page-title">AR Aging</h2>
+  <p class="page-sub">Unpaid invoices, grouped by how long they've been outstanding since the invoice date.</p>
+  <div class="kpi-grid">
+    ${AGING_BUCKETS.map((b) => `<div class="kpi"><div class="label">${b}</div><div class="value">${fmtMoney(bucketTotal(b))}</div></div>`).join("")}
+    <div class="kpi accent"><div class="label">Total outstanding</div><div class="value">${fmtMoney(grandTotal)}</div></div>
+  </div>
+  <div class="card">
+    <table>
+      <thead><tr><th>Invoice</th><th>Customer</th><th>Invoice date</th><th>Bucket</th><th class="right">Amount (SAR)</th></tr></thead>
+      <tbody>
+        ${rowsData.length ? rowsData.map((r) => `
+          <tr><td>${esc(r.inv.invoice_number)}</td><td>${esc(r.inv.customer)}</td><td>${fmtDate(r.inv.invoice_date)}</td>
+          <td>${pill(r.bucket, agingPillCls(r.bucket))}</td>
+          <td class="right">${fmtMoney(r.total)}</td></tr>`).join("") : `<tr><td colspan="5" class="empty-state">Nothing outstanding — every invoice is paid.</td></tr>`}
+      </tbody>
+    </table>
+  </div>`;
+}
+
+// -------------------------------------------------------------------- AP Aging
+
+function renderAPAging() {
+  const rowsData = [
+    ...state.apExpenses.map((e) => ({ type: "Expense", number: e.expense_number, who: e.vendor || e.category || "—", date: e.expense_date, amount: Number(e.amount || 0) })),
+    ...state.apPayrollRuns.map((r) => ({ type: "Payroll", number: r.pr_number, who: "Period " + r.period, date: (r.approved_at || r.created_at || "").slice(0, 10), amount: Number(state.apPayrollNetByRun[r.id] || 0) })),
+  ].map((r) => ({ ...r, bucket: agingBucket(r.date) }));
+  const bucketTotal = (b) => rowsData.filter((r) => r.bucket === b).reduce((s, r) => s + r.amount, 0);
+  const grandTotal = rowsData.reduce((s, r) => s + r.amount, 0);
+  return `
+  <h2 class="page-title">AP Aging</h2>
+  <p class="page-sub">Approved but unpaid expenses and payroll runs — what the company currently owes.</p>
+  <div class="kpi-grid">
+    ${AGING_BUCKETS.map((b) => `<div class="kpi"><div class="label">${b}</div><div class="value">${fmtMoney(bucketTotal(b))}</div></div>`).join("")}
+    <div class="kpi accent"><div class="label">Total payable</div><div class="value">${fmtMoney(grandTotal)}</div></div>
+  </div>
+  <div class="card">
+    <table>
+      <thead><tr><th>Type</th><th>No.</th><th>Vendor / Period</th><th>Date</th><th>Bucket</th><th class="right">Amount (SAR)</th></tr></thead>
+      <tbody>
+        ${rowsData.length ? rowsData.map((r) => `
+          <tr><td>${esc(r.type)}</td><td>${esc(r.number)}</td><td>${esc(r.who)}</td><td>${fmtDate(r.date)}</td>
+          <td>${pill(r.bucket, agingPillCls(r.bucket))}</td>
+          <td class="right">${fmtMoney(r.amount)}</td></tr>`).join("") : `<tr><td colspan="6" class="empty-state">Nothing payable right now.</td></tr>`}
+      </tbody>
+    </table>
+  </div>`;
+}
+
+// ----------------------------------------------------------------- Period Close
+
+function renderPeriodClose() {
+  const pd = state.periodDraft;
+  return `
+  <h2 class="page-title">Period Close</h2>
+  <p class="page-sub">Closing a period blocks any new posting dated inside it — for anyone, including the automated postings from work orders, expenses and payroll. Reopen it to make corrections.</p>
+  <div class="card">
+    <h3>Create a period</h3>
+    <form onsubmit="return App.createPeriod(event)">
+      <div class="form-row">
+        <div class="field"><label>Label</label><input value="${esc(pd.period_label)}" oninput="App.setPeriodField('period_label',this.value)" placeholder="e.g. September 2026" required></div>
+        <div class="field"><label>Start date</label><input type="date" value="${esc(pd.start_date)}" oninput="App.setPeriodField('start_date',this.value)" required></div>
+        <div class="field"><label>End date</label><input type="date" value="${esc(pd.end_date)}" oninput="App.setPeriodField('end_date',this.value)" required></div>
+        <div class="field" style="flex:0"><label>&nbsp;</label><button class="btn btn-primary" type="submit">Create</button></div>
+      </div>
+    </form>
+  </div>
+  <div class="card">
+    <table>
+      <thead><tr><th>Period</th><th>Start</th><th>End</th><th>Status</th><th></th></tr></thead>
+      <tbody>
+        ${state.accountingPeriods.length ? state.accountingPeriods.map((p) => `
+          <tr>
+            <td>${esc(p.period_label)}</td><td>${fmtDate(p.start_date)}</td><td>${fmtDate(p.end_date)}</td>
+            <td>${p.status === "Open" ? pill("Open", "open") : pill("Closed", "closed")}</td>
+            <td>${p.status === "Open"
+              ? `<button class="btn btn-ghost btn-sm" onclick="App.closePeriodAction('${p.id}')">Close</button>`
+              : `<button class="btn btn-ghost btn-sm" onclick="App.reopenPeriodAction('${p.id}')">Reopen</button>`}</td>
+          </tr>`).join("") : `<tr><td colspan="5" class="empty-state">No accounting periods yet.</td></tr>`}
       </tbody>
     </table>
   </div>`;
