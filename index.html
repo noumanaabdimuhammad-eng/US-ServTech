@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>US ServTech — Operations</title>
+<link rel="icon" href="data:,">
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
+<style>
+  :root {
+    --navy: #1f3b57; --navy-dark: #142838; --gold: #c9a24b;
+    --bg: #f4f1ea; --card: #ffffff; --border: #e2ddd0;
+    --text: #1f2937; --muted: #6b7280;
+    --green: #1e7a4a; --green-bg: #d9f2e3;
+    --amber: #92650a; --amber-bg: #fcefd1;
+    --red: #b3261e; --red-bg: #fbe3e1;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: var(--bg); color: var(--text); }
+  #app { min-height: 100vh; }
+
+  /* ---- Login ---- */
+  .login-wrap { min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 16px; }
+  .login-card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 36px; width: 100%; max-width: 380px; box-shadow: 0 8px 24px rgba(31,59,87,0.08); }
+  .login-card h1 { font-size: 20px; color: var(--navy); margin: 0 0 4px; }
+  .login-card p.sub { color: var(--muted); font-size: 13px; margin: 0 0 24px; }
+  .field { margin-bottom: 14px; }
+  .field label { display: block; font-size: 12px; font-weight: 600; color: var(--muted); margin-bottom: 4px; }
+  .field input, .field select, .field textarea { width: 100%; padding: 9px 10px; border: 1px solid var(--border); border-radius: 6px; font-size: 14px; font-family: inherit; background: #fff; }
+  .field input:focus, .field select:focus, .field textarea:focus { outline: 2px solid var(--gold); outline-offset: -1px; }
+  .btn { display: inline-block; padding: 9px 16px; border-radius: 6px; border: none; font-size: 13px; font-weight: 600; cursor: pointer; }
+  .btn-primary { background: var(--navy); color: #fff; }
+  .btn-primary:hover { background: var(--navy-dark); }
+  .btn-ghost { background: transparent; color: var(--navy); border: 1px solid var(--border); }
+  .btn-ghost:hover { background: #f0ede4; }
+  .btn-danger { background: var(--red); color: #fff; }
+  .btn-sm { padding: 5px 10px; font-size: 12px; }
+  .btn:disabled { opacity: .5; cursor: default; }
+  .error-msg { color: var(--red); font-size: 13px; margin-top: 8px; min-height: 18px; }
+
+  /* ---- Shell ---- */
+  .topbar { background: var(--navy); color: #fff; padding: 0 20px; display: flex; align-items: center; height: 56px; gap: 24px; position: sticky; top: 0; z-index: 10; }
+  .topbar .brand { font-weight: 700; font-size: 15px; letter-spacing: .3px; }
+  .topbar nav { display: flex; gap: 4px; flex: 1; overflow-x: auto; }
+  .topbar nav button { background: none; border: none; color: rgba(255,255,255,.75); padding: 8px 12px; border-radius: 6px; cursor: pointer; font-size: 13px; white-space: nowrap; }
+  .topbar nav button:hover { background: rgba(255,255,255,.08); color: #fff; }
+  .topbar nav button.active { background: rgba(255,255,255,.14); color: #fff; font-weight: 600; }
+  .topbar .who { font-size: 12px; color: rgba(255,255,255,.7); display: flex; align-items: center; gap: 10px; }
+  .topbar .who b { color: #fff; }
+
+  main { max-width: 1100px; margin: 0 auto; padding: 24px 20px 60px; }
+  h2.page-title { font-size: 19px; color: var(--navy); margin: 0 0 4px; }
+  p.page-sub { color: var(--muted); font-size: 13px; margin: 0 0 20px; }
+
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 18px; margin-bottom: 16px; }
+  .card h3 { font-size: 14px; margin: 0 0 12px; color: var(--navy); }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); padding: 8px 10px; border-bottom: 2px solid var(--border); }
+  td { padding: 9px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  tr:last-child td { border-bottom: none; }
+  tr.clickable { cursor: pointer; }
+  tr.clickable:hover { background: #faf9f6; }
+
+  .pill { display: inline-block; padding: 2px 9px; border-radius: 99px; font-size: 11px; font-weight: 600; }
+  .pill-delivered { background: var(--green-bg); color: var(--green); }
+  .pill-completed { background: var(--amber-bg); color: var(--amber); }
+  .pill-process { background: #eef0f3; color: #4b5563; }
+  .pill-cancelled { background: var(--red-bg); color: var(--red); }
+  .pill-paid { background: var(--green-bg); color: var(--green); }
+  .pill-unpaid { background: var(--amber-bg); color: var(--amber); }
+  .pill-pending { background: #eef0f3; color: #4b5563; }
+  .pill-accepted { background: var(--green-bg); color: var(--green); }
+  .pill-rejected { background: var(--red-bg); color: var(--red); }
+
+  .kpi-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 20px; }
+  .kpi { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
+  .kpi .label { font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+  .kpi .value { font-size: 24px; font-weight: 700; color: var(--navy); font-variant-numeric: tabular-nums; }
+
+  .form-row { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; }
+  .form-row .field { flex: 1; min-width: 140px; margin-bottom: 0; }
+  .task-row { display: flex; gap: 8px; align-items: center; margin-bottom: 6px; }
+  .task-row input[type=text] { flex: 2; } .task-row input[type=number] { flex: 1; max-width: 100px; }
+  .subtle { color: var(--muted); font-size: 12px; }
+  .right { text-align: right; }
+  .totals-line { font-size: 13px; margin-top: 8px; }
+  .totals-line b { color: var(--navy); }
+  .empty-state { color: var(--muted); font-size: 13px; padding: 20px; text-align: center; }
+  .wo-detail { background: #faf9f6; border-radius: 8px; padding: 12px; margin-top: 6px; }
+  .toast { position: fixed; bottom: 20px; right: 20px; background: var(--navy); color: #fff; padding: 10px 16px; border-radius: 8px; font-size: 13px; z-index: 100; box-shadow: 0 4px 12px rgba(0,0,0,.15); }
+  .toast.error { background: var(--red); }
+  .link-btn { background: none; border: none; color: var(--navy); text-decoration: underline; cursor: pointer; font-size: 12px; padding: 0; }
+</style>
+</head>
+<body>
+<div id="app"><div class="empty-state">Loading…</div></div>
+<script src="/app.js"></script>
+</body>
+</html>

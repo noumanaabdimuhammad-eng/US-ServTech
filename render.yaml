@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: us-servtech-ops
+    runtime: static
+    buildCommand: ""
+    staticPublishPath: ./public
+    pullRequestPreviewsEnabled: false
