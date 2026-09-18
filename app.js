@@ -778,10 +778,23 @@ async function init() {
   state.loading = false;
   render();
 
-  sb.auth.onAuthStateChange(async (_event, session) => {
+  sb.auth.onAuthStateChange((_event, session) => {
     const wasIn = !!state.session;
     state.session = session;
-    if (session && !wasIn) { await afterLogin(); render(); }
+    if (session && !wasIn) {
+      // IMPORTANT: do not await Supabase calls directly inside this callback.
+      // supabase-js v2 holds an internal auth lock for the duration of this
+      // callback, and afterLogin() below issues sb.from(...) queries that
+      // need that same lock to attach the auth token — awaiting them here
+      // deadlocks the client, which is exactly what caused the "stuck on
+      // Signing in..." bug (it only ever resolved after a manual page
+      // refresh re-ran init() from scratch). Deferring with setTimeout lets
+      // this callback return first and release the lock before the queries run.
+      setTimeout(async () => {
+        await afterLogin();
+        render();
+      }, 0);
+    }
     if (!session) { state.profile = null; render(); }
   });
 }
@@ -811,9 +824,24 @@ App.login = async function (ev) {
   state.authBusy = true;
   render();
   const { email, password } = fd(ev.target);
-  const { error } = await sb.auth.signInWithPassword({ email, password });
+  const { data, error } = await sb.auth.signInWithPassword({ email, password });
   state.authBusy = false;
   if (error) { state.authError = error.message; render(); return false; }
+  // Drive the transition into the app directly here rather than relying on
+  // the onAuthStateChange listener to do it. Previously this function only
+  // called signInWithPassword and waited for onAuthStateChange to notice the
+  // new session, load the profile, and render -- if that event was ever
+  // delayed or missed (Supabase's SIGNED_IN notification is not guaranteed
+  // to fire immediately), the button stayed stuck on "Signing in..."
+  // forever, and only a manual page refresh (which re-runs init()'s own
+  // direct getSession() check) recovered. Setting state.session and calling
+  // afterLogin()/render() here makes a successful sign-in self-sufficient.
+  // onAuthStateChange's own SIGNED_IN handling below still runs after this
+  // (e.g. for other tabs signing in), but its `wasIn` guard skips re-running
+  // afterLogin() since state.session is already set by the time it fires.
+  state.session = data.session;
+  await afterLogin();
+  render();
   return false;
 };
 App.logout = async function () {
