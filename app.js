@@ -51,6 +51,7 @@ const MODULES = {
   finance: {
     label: "Finance",
     tabs: [
+      { id: "financedashboard", label: "Dashboard" },
       { id: "chartofaccounts", label: "Chart of Accounts" },
       { id: "journalentries", label: "Journal Entries" },
       { id: "generalledger", label: "General Ledger" },
@@ -73,6 +74,7 @@ const MODULES = {
     // one long flat row. Whichever group contains the current view is the
     // one shown expanded; clicking a group jumps to its first tab.
     groups: [
+      { label: "Overview", tabs: ["financedashboard"] },
       { label: "Accounting", tabs: ["chartofaccounts", "journalentries", "generalledger", "bankaccounts"] },
       { label: "Reports", tabs: ["trialbalance", "incomestatement", "balancesheet", "cashflow", "araging", "apaging"] },
       { label: "Payroll & Assets", tabs: ["expenses", "employees", "payroll", "fixedassets"] },
@@ -134,6 +136,13 @@ const state = {
     incomestatement: { from: firstOfThisMonth(), to: new Date().toISOString().slice(0, 10) },
     balancesheet: { asOf: new Date().toISOString().slice(0, 10) },
     cashflow: { from: firstOfThisMonth(), to: new Date().toISOString().slice(0, 10) },
+    financedashboard: { from: firstOfThisMonth(), to: new Date().toISOString().slice(0, 10) },
+  },
+  financeDashboardPreset: "thismonth", // which quick period button is active, or "" once custom dates are run
+  financeDashboard: {
+    revenue: 0, expense: 0, netIncome: 0, netCashFlow: 0,
+    beginCash: 0, endCash: 0, arTotal: 0, apTotal: 0,
+    trend: [], // last 6 months: [{ label, revenue, expense }, ...]
   },
   tasksByParent: {},   // parent_id -> [task,...]
   expanded: {},        // "table:id" -> true
@@ -199,6 +208,34 @@ function dayBefore(dateStr) {
   const d = new Date(dateStr + "T00:00:00");
   d.setDate(d.getDate() - 1);
   return d.toISOString().slice(0, 10);
+}
+// ---- month math for the Finance Dashboard's period presets and trend chart
+function todayIso() {
+  return new Date().toISOString().slice(0, 10);
+}
+function monthBounds(dateStr) {
+  const d = new Date(dateStr + "T00:00:00");
+  const start = new Date(d.getFullYear(), d.getMonth(), 1);
+  const end = new Date(d.getFullYear(), d.getMonth() + 1, 0);
+  return { start: start.toISOString().slice(0, 10), end: end.toISOString().slice(0, 10) };
+}
+function addMonths(dateStr, n) {
+  const d = new Date(dateStr + "T00:00:00");
+  return new Date(d.getFullYear(), d.getMonth() + n, 1).toISOString().slice(0, 10);
+}
+function monthLabel(dateStr) {
+  return new Date(dateStr + "T00:00:00").toLocaleDateString("en-GB", { month: "short", year: "2-digit" });
+}
+function quarterBounds(dateStr) {
+  const d = new Date(dateStr + "T00:00:00");
+  const qStartMonth = Math.floor(d.getMonth() / 3) * 3;
+  const start = new Date(d.getFullYear(), qStartMonth, 1);
+  const end = new Date(d.getFullYear(), qStartMonth + 3, 0);
+  return { start: start.toISOString().slice(0, 10), end: end.toISOString().slice(0, 10) };
+}
+function yearBounds(dateStr) {
+  const y = new Date(dateStr + "T00:00:00").getFullYear();
+  return { start: `${y}-01-01`, end: `${y}-12-31` };
 }
 // How long an AR/AP item has been outstanding, bucketed the way the AR/AP
 // Aging reports group them — see AGING_BUCKETS above.
@@ -409,6 +446,62 @@ async function loadAPAging() {
     });
   }
 }
+// Same total-outstanding math as renderARAging/renderAPAging use for their
+// own tables — pulled out here so the dashboard's cards agree with those
+// screens exactly, without re-deriving the formula.
+function computeArTotal() {
+  return state.arInvoices.reduce((s, inv) => {
+    const wo = state.arWoById[inv.wo_id] || {};
+    const tasks = state.arTasksByInvoice[inv.id] || [];
+    return s + taskTotals(tasks, wo.discount, wo.accounting_system).total;
+  }, 0);
+}
+function computeApTotal() {
+  const expTotal = state.apExpenses.reduce((s, e) => s + Number(e.amount || 0), 0);
+  const prTotal = state.apPayrollRuns.reduce((s, r) => s + Number(state.apPayrollNetByRun[r.id] || 0), 0);
+  return expTotal + prTotal;
+}
+// The Finance Dashboard: sales/expenses/net-income/net-cash-flow for the
+// selected period, cash and AR/AP outstanding as of today, and a trailing
+// 6-month Sales vs Expenses trend (independent of the period picker, so
+// there's always a "where are we headed" view even for a one-day range).
+async function loadFinanceDashboard() {
+  if (!isMgmt()) return;
+  const { from, to } = state.statementDates.financedashboard;
+  const trendMonths = [5, 4, 3, 2, 1, 0].map((i) => monthBounds(addMonths(to, -i)));
+  const [isRes, cfRes, tbBefore, tbTo, ...trendRes] = await Promise.all([
+    sb.rpc("income_statement", { p_from: from, p_to: to }),
+    sb.rpc("cash_flow_statement", { p_from: from, p_to: to }),
+    sb.rpc("trial_balance", { p_as_of: dayBefore(from) }),
+    sb.rpc("trial_balance", { p_as_of: to }),
+    ...trendMonths.map((m) => sb.rpc("income_statement", { p_from: m.start, p_to: m.end })),
+    loadARAging(),
+    loadAPAging(),
+  ]);
+  const isRows = isRes.error ? [] : (isRes.data || []);
+  const revenue = isRows.filter((r) => r.account_type === "Revenue").reduce((s, r) => s + Number(r.amount || 0), 0);
+  const expense = isRows.filter((r) => r.account_type === "Expense").reduce((s, r) => s + Number(r.amount || 0), 0);
+  const cfRows = cfRes.error ? [] : (cfRes.data || []);
+  const netCashFlow = cfRows.reduce((s, r) => s + Number(r.amount || 0), 0);
+  const sumCash = (rows) => (rows || []).filter((r) => r.code && r.code.startsWith("CASH-"))
+    .reduce((s, r) => s + Number(r.debit || 0) - Number(r.credit || 0), 0);
+  const trend = trendMonths.map((m, idx) => {
+    const res = trendRes[idx];
+    const r = res && !res.error ? (res.data || []) : [];
+    return {
+      label: monthLabel(m.start),
+      revenue: r.filter((x) => x.account_type === "Revenue").reduce((s, x) => s + Number(x.amount || 0), 0),
+      expense: r.filter((x) => x.account_type === "Expense").reduce((s, x) => s + Number(x.amount || 0), 0),
+    };
+  });
+  state.financeDashboard = {
+    revenue, expense, netIncome: revenue - expense, netCashFlow,
+    beginCash: tbBefore.error ? 0 : sumCash(tbBefore.data),
+    endCash: tbTo.error ? 0 : sumCash(tbTo.data),
+    arTotal: computeArTotal(), apTotal: computeApTotal(),
+    trend,
+  };
+}
 async function loadTasksFor(parentId) {
   const { data, error } = await sb.from("tasks").select("*").eq("parent_id", parentId).order("created_at");
   if (!error) state.tasksByParent[parentId] = data || [];
@@ -472,6 +565,7 @@ async function loadView(view) {
     if (view === "employees") await loadEmployees();
     if (view === "payroll") await Promise.all([loadPayrollRuns(), loadEmployees(), loadBankAccounts()]);
     if (view === "fixedassets") await Promise.all([loadFixedAssets(), loadBankAccounts()]);
+    if (view === "financedashboard") await loadFinanceDashboard();
     if (view === "chartofaccounts") await loadLedger();
     if (view === "bankaccounts") await Promise.all([loadLedger(), loadBankAccounts()]);
     if (view === "journalentries") await Promise.all([loadJournalEntries(), loadLedger(), loadBankAccounts(), loadAccountingPeriods()]);
@@ -1266,6 +1360,57 @@ App.exportCashFlow = function () {
   ]);
 };
 
+// ------------------------------------------------------------ Finance Dashboard
+
+const FINANCE_DASH_PRESETS = [
+  { id: "thismonth", label: "This month" },
+  { id: "lastmonth", label: "Last month" },
+  { id: "thisquarter", label: "This quarter" },
+  { id: "thisyear", label: "This year" },
+];
+App.setFinanceDashboardDate = function (field, value) {
+  state.statementDates.financedashboard[field] = value;
+  state.financeDashboardPreset = "custom";
+};
+App.setFinanceDashboardPreset = async function (preset) {
+  const today = todayIso();
+  let range;
+  if (preset === "thismonth") range = monthBounds(today);
+  else if (preset === "lastmonth") range = monthBounds(addMonths(today, -1));
+  else if (preset === "thisquarter") range = quarterBounds(today);
+  else if (preset === "thisyear") range = yearBounds(today);
+  else range = { start: state.statementDates.financedashboard.from, end: state.statementDates.financedashboard.to };
+  state.financeDashboardPreset = preset;
+  state.statementDates.financedashboard = { from: range.start, to: range.end };
+  await loadFinanceDashboard();
+  render();
+};
+App.runFinanceDashboard = async function (ev) {
+  ev.preventDefault();
+  state.financeDashboardPreset = "custom";
+  await loadFinanceDashboard();
+  render();
+  return false;
+};
+App.exportFinanceDashboard = function () {
+  const d = state.financeDashboard;
+  const { from, to } = state.statementDates.financedashboard;
+  const summary = [
+    { Metric: "Sales (revenue)", "Amount (SAR)": d.revenue },
+    { Metric: "Expenses", "Amount (SAR)": d.expense },
+    { Metric: "Net income", "Amount (SAR)": d.netIncome },
+    { Metric: "Net cash flow", "Amount (SAR)": d.netCashFlow },
+    { Metric: "Cash on hand (period end)", "Amount (SAR)": d.endCash },
+    { Metric: "AR outstanding (as of today)", "Amount (SAR)": d.arTotal },
+    { Metric: "AP outstanding (as of today)", "Amount (SAR)": d.apTotal },
+  ];
+  const trend = d.trend.map((m) => ({ Month: m.label, Sales: m.revenue, Expenses: m.expense, "Net": m.revenue - m.expense }));
+  exportRowsToExcel(`finance-dashboard-${from}-to-${to}.xlsx`, [
+    { name: "Summary", rows: summary },
+    { name: "6-Month Trend", rows: trend },
+  ]);
+};
+
 // -------------------------------------------------------------- AR/AP aging
 
 App.exportARAging = function () {
@@ -1411,6 +1556,7 @@ function renderView() {
     case "employees": return isMgmt() ? renderEmployees() : mgmtOnlyView();
     case "payroll": return isMgmt() ? renderPayroll() : mgmtOnlyView();
     case "fixedassets": return isMgmt() ? renderFixedAssets() : mgmtOnlyView();
+    case "financedashboard": return isMgmt() ? renderFinanceDashboard() : mgmtOnlyView();
     case "chartofaccounts": return isMgmt() ? renderChartOfAccounts() : mgmtOnlyView();
     case "bankaccounts": return isMgmt() ? renderBankAccounts() : mgmtOnlyView();
     case "journalentries": return isMgmt() ? renderJournalEntries() : mgmtOnlyView();
@@ -2223,6 +2369,64 @@ function renderGeneralLedger() {
 }
 
 // -------------------------------------------------------------- Trial Balance
+
+// ------------------------------------------------------------ Finance Dashboard
+
+function renderTrendChart(trend) {
+  const maxVal = Math.max(1, ...trend.flatMap((m) => [Number(m.revenue) || 0, Number(m.expense) || 0]));
+  const groupW = 100, barW = 26, gap = 8, chartH = 140, baseY = 160;
+  const offset = (groupW - (barW * 2 + gap)) / 2;
+  const bars = trend.map((m, i) => {
+    const gx = 40 + i * groupW;
+    const revH = Math.round((Number(m.revenue) / maxVal) * chartH);
+    const expH = Math.round((Number(m.expense) / maxVal) * chartH);
+    const revX = gx + offset, expX = revX + barW + gap;
+    return `
+      <g>
+        <rect x="${revX}" y="${baseY - revH}" width="${barW}" height="${Math.max(revH, 0)}" rx="3" fill="var(--green)"><title>${esc(m.label)} sales: ${fmtMoney(m.revenue)}</title></rect>
+        <rect x="${expX}" y="${baseY - expH}" width="${barW}" height="${Math.max(expH, 0)}" rx="3" fill="var(--red)"><title>${esc(m.label)} expenses: ${fmtMoney(m.expense)}</title></rect>
+        <text x="${gx + groupW / 2}" y="${baseY + 18}" text-anchor="middle" font-size="11" fill="var(--muted)">${esc(m.label)}</text>
+      </g>`;
+  }).join("");
+  return `<svg viewBox="0 0 640 190" width="100%" style="max-width:640px;display:block" role="img" aria-label="Sales vs expenses, trailing 6 months">
+    <line x1="40" y1="${baseY}" x2="620" y2="${baseY}" stroke="var(--border)" stroke-width="1"/>
+    ${bars}
+  </svg>`;
+}
+
+function renderFinanceDashboard() {
+  const { from, to } = state.statementDates.financedashboard;
+  const d = state.financeDashboard;
+  const preset = state.financeDashboardPreset;
+  return `
+  <h2 class="page-title">Finance Dashboard</h2>
+  <p class="page-sub">Sales, expenses and cash flow for the selected period, plus cash and AR/AP outstanding as of today.</p>
+  <div class="card">
+    <form class="statement-meta" onsubmit="return App.runFinanceDashboard(event)">
+      <div class="dash-presets">
+        ${FINANCE_DASH_PRESETS.map((p) => `<button type="button" class="btn btn-ghost btn-sm ${preset === p.id ? "active" : ""}" onclick="App.setFinanceDashboardPreset('${p.id}')">${p.label}</button>`).join("")}
+      </div>
+      <div class="field"><label>From</label><input type="date" value="${esc(from)}" oninput="App.setFinanceDashboardDate('from',this.value)"></div>
+      <div class="field"><label>To</label><input type="date" value="${esc(to)}" oninput="App.setFinanceDashboardDate('to',this.value)"></div>
+      <div class="field" style="flex:0"><button class="btn btn-ghost btn-sm" type="submit">Run</button></div>
+      <div class="field" style="flex:0"><button class="btn btn-ghost btn-sm" type="button" onclick="App.exportFinanceDashboard()">Export to Excel</button></div>
+    </form>
+  </div>
+  <div class="kpi-grid">
+    <div class="kpi accent"><div class="label">Sales</div><div class="value">${fmtMoney(d.revenue)}</div><div class="hint">${fmtDate(from)} – ${fmtDate(to)}</div></div>
+    <div class="kpi"><div class="label">Expenses</div><div class="value">${fmtMoney(d.expense)}</div><div class="hint">${fmtDate(from)} – ${fmtDate(to)}</div></div>
+    <div class="kpi ${d.netIncome < 0 ? "negative" : ""}"><div class="label">Net income</div><div class="value">${fmtMoney(d.netIncome)}</div><div class="hint">Sales minus expenses</div></div>
+    <div class="kpi ${d.netCashFlow < 0 ? "negative" : ""}"><div class="label">Net cash flow</div><div class="value">${fmtMoney(d.netCashFlow)}</div><div class="hint">Cash in minus cash out</div></div>
+    <div class="kpi"><div class="label">Cash on hand</div><div class="value">${fmtMoney(d.endCash)}</div><div class="hint">As of ${fmtDate(to)}</div></div>
+    <div class="kpi"><div class="label">AR outstanding</div><div class="value">${fmtMoney(d.arTotal)}</div><div class="hint">Unpaid invoices, as of today</div></div>
+    <div class="kpi"><div class="label">AP outstanding</div><div class="value">${fmtMoney(d.apTotal)}</div><div class="hint">Owed to vendors &amp; payroll, as of today</div></div>
+  </div>
+  <div class="card trend-card">
+    <h3 style="margin:0 0 4px;font-size:14px;color:var(--ink)">Sales vs expenses — trailing 6 months</h3>
+    <div class="trend-legend"><span><span class="dot" style="background:var(--green)"></span>Sales</span><span><span class="dot" style="background:var(--red)"></span>Expenses</span></div>
+    ${renderTrendChart(d.trend)}
+  </div>`;
+}
 
 function renderTrialBalance() {
   const asOf = state.statementDates.trialbalance.asOf;

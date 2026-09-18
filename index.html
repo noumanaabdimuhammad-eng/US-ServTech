@@ -41,7 +41,7 @@
   .field label { display: block; font-size: 12px; font-weight: 600; color: var(--muted); margin-bottom: 4px; }
   .field input, .field select, .field textarea { width: 100%; padding: 9px 10px; border: 1px solid var(--border); border-radius: 7px; font-size: 14px; font-family: inherit; background: #fff; color: var(--text); }
   .field input:focus, .field select:focus, .field textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
-  .btn { display: inline-block; padding: 9px 16px; border-radius: 7px; border: none; font-size: 13px; font-weight: 600; cursor: pointer; font-family: inherit; }
+  .btn { display: inline-block; padding: 9px 16px; border-radius: 7px; border: none; font-size: 13px; font-weight: 600; cursor: pointer; font-family: inherit; white-space: nowrap; }
   .btn-primary { background: var(--ink); color: #fff; }
   .btn-primary:hover { background: var(--ink-3); }
   .btn-ghost { background: transparent; color: var(--ink); border: 1px solid var(--border); }
@@ -143,6 +143,15 @@
   .balance-flag { font-size: 12px; padding: 3px 10px; border-radius: 99px; font-weight: 600; }
   .balance-flag.ok { background: var(--green-bg); color: var(--green); }
   .balance-flag.bad { background: var(--red-bg); color: var(--red); }
+
+  /* ---- Finance Dashboard ---- */
+  .kpi .hint { font-size: 11px; color: var(--muted); margin-top: 4px; }
+  .kpi.negative .value { color: var(--red); }
+  .dash-presets { display: flex; gap: 8px; flex-wrap: wrap; }
+  .dash-presets button.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .trend-card .trend-legend { display: flex; gap: 18px; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+  .trend-card .trend-legend .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 5px; vertical-align: -1px; }
+  .trend-card svg text { font-family: inherit; }
   .je-lines-mini { font-size: 12px; color: var(--muted); }
   .badge-count { display: inline-flex; align-items: center; justify-content: center; min-width: 18px; height: 18px; padding: 0 5px; border-radius: 99px; background: var(--red); color: #fff; font-size: 10px; font-weight: 700; margin-left: 4px; }
 </style>
