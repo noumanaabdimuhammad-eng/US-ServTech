@@ -12,14 +12,14 @@
 <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
 <style>
   :root {
-    /* ---- Neutrals ---- */
-    --ink: #0a0e1a; --ink-2: #121a2c; --ink-3: #1a2540;
-    --bg: #f4f5f8; --card: #ffffff; --border: #e2e5eb; --border-soft: #edeff3;
-    --text: #172033; --muted: #66708a;
+    /* ---- Neutrals (deep blue ink, not black) ---- */
+    --ink: #0a1c33; --ink-2: #0f2c50; --ink-3: #153a68;
+    --bg: #f4f6f9; --card: #ffffff; --border: #dfe4ec; --border-soft: #edf1f6;
+    --text: #16233a; --muted: #5c6b85;
 
-    /* ---- Module accents: Operations = teal, Finance = indigo ---- */
+    /* ---- Module accents: Operations = teal, Finance = blue ---- */
     --op-accent: #0d9488; --op-accent-dark: #0b7d73; --op-accent-bg: #e5f6f4;
-    --fin-accent: #4f46e5; --fin-accent-dark: #4034c9; --fin-accent-bg: #edebfd;
+    --fin-accent: #2563eb; --fin-accent-dark: #1d4fc7; --fin-accent-bg: #e7eefd;
     --accent: var(--op-accent); --accent-dark: var(--op-accent-dark); --accent-bg: var(--op-accent-bg);
 
     /* ---- Semantic ---- */
@@ -46,7 +46,7 @@
 
   /* ---- Login ---- */
   .login-wrap { min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 16px;
-    background: radial-gradient(1100px 700px at 18% 8%, #1c2c4d 0%, var(--ink) 46%, #05070d 100%); }
+    background: radial-gradient(1100px 700px at 18% 8%, #1e4a80 0%, var(--ink) 46%, #030c18 100%); }
   .login-card { background: var(--card); border: 1px solid rgba(255,255,255,.06); border-radius: var(--radius-lg); padding: 40px; width: 100%; max-width: 408px; box-shadow: var(--shadow-lg); }
   .login-card .login-brand { display: flex; align-items: center; gap: 12px; margin-bottom: 22px; }
   .login-card h1 { font-size: 20px; font-weight: 800; color: var(--ink); margin: 0; letter-spacing: -.015em; }
@@ -158,6 +158,9 @@
   .toast { position: fixed; bottom: 22px; right: 22px; background: var(--ink); color: #fff; padding: 11px 18px; border-radius: var(--radius-sm); font-size: 13px; font-weight: 500; z-index: 100; box-shadow: var(--shadow-lg); }
   .toast.error { background: var(--red); }
   .link-btn { background: none; border: none; color: var(--accent-dark); text-decoration: underline; text-underline-offset: 2px; cursor: pointer; font-size: 12px; font-weight: 500; padding: 0; font-family: inherit; }
+  .link-btn.danger { color: var(--red); }
+  tr.coa-edit-row td { background: var(--accent-bg); vertical-align: middle; }
+  tr.coa-edit-row input, tr.coa-edit-row select { padding: 6px 8px; border: 1.5px solid var(--border); border-radius: var(--radius-sm); font-size: 13px; font-family: inherit; background: #fff; color: var(--text); }
 
   /* ---- Finance-specific ---- */
   .statement-meta { display: flex; gap: 16px; align-items: flex-end; margin-bottom: 18px; flex-wrap: wrap; }
@@ -172,6 +175,13 @@
   /* ---- Finance Dashboard ---- */
   .kpi .hint { font-size: 11px; color: var(--muted); margin-top: 5px; }
   .kpi.negative .value { color: var(--red); }
+  .kpi.clickable { cursor: pointer; transition: box-shadow .12s ease, transform .06s ease; user-select: none; }
+  .kpi.clickable:hover { box-shadow: var(--shadow-sm); transform: translateY(-1px); }
+  .kpi.selected::before { background: var(--kpi-color, var(--accent)); width: 4px; }
+  .kpi.selected { box-shadow: 0 0 0 1.5px var(--kpi-color, var(--accent)) inset, var(--shadow-xs); }
+  .kpi.selected .label { color: var(--kpi-color, var(--accent)); }
+  .trend-legend button.leg-item { display: inline-flex; align-items: center; gap: 6px; background: none; border: none; cursor: pointer; font: inherit; font-size: 12px; color: var(--muted); padding: 3px 0; opacity: .55; }
+  .trend-legend button.leg-item.active { opacity: 1; color: var(--text); font-weight: 600; }
   .dash-presets { display: flex; gap: 8px; flex-wrap: wrap; }
   .dash-presets button.active { background: var(--accent); color: #fff; border-color: var(--accent); }
   .trend-card .trend-legend { display: flex; gap: 18px; font-size: 12px; color: var(--muted); margin-bottom: 6px; }

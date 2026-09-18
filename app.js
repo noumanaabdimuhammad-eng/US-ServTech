@@ -96,6 +96,14 @@ const AGING_BUCKETS = ["0–30 days", "31–60 days", "61–90 days", "90+ days"
 // the Add-account type dropdown, and is the order Odoo lists account types in.
 const ACCOUNT_TYPES = ["Asset", "ContraAsset", "Liability", "Equity", "ContraEquity", "Revenue", "Expense"];
 
+// Codes several database trigger functions post to directly (revenue
+// recognition, depreciation, invoice/payroll payment, asset purchase — see
+// maybe_finalize_work_order, run_monthly_depreciation, post_invoice_payment,
+// post_payroll_payment, post_asset_purchase). Deleting one of these would
+// break those triggers the next time they fire, so the Chart of Accounts
+// screen never offers Delete for them — renaming or retyping is still fine.
+const SYSTEM_ACCOUNT_CODES = ["1100", "1200", "1250", "2100", "4000", "5100", "5200"];
+
 const state = {
   session: null,
   profile: null,
@@ -133,6 +141,7 @@ const state = {
   jeFilter: { search: "", status: "", from: "", to: "" },
   coaSearch: "",
   coaCollapsed: {},     // account_type -> true when that group is collapsed
+  coaEditingCode: null, // code of the account currently shown as an inline edit row (null = none)
   periodDraft: { period_label: "", start_date: "", end_date: "" },
   statementDates: {
     trialbalance: { asOf: new Date().toISOString().slice(0, 10) },
@@ -142,10 +151,11 @@ const state = {
     financedashboard: { from: firstOfThisMonth(), to: new Date().toISOString().slice(0, 10) },
   },
   financeDashboardPreset: "thismonth", // which quick period button is active, or "" once custom dates are run
+  financeDashboardMetrics: ["revenue", "expense"], // which KPI tiles are selected onto the trend chart
   financeDashboard: {
     revenue: 0, expense: 0, netIncome: 0, netCashFlow: 0,
     beginCash: 0, endCash: 0, arTotal: 0, apTotal: 0,
-    trend: [], // last 6 months: [{ label, revenue, expense }, ...]
+    trend: [], // last 6 months: [{ label, revenue, expense, netIncome, netCashFlow, cashOnHand, arOutstanding, apOutstanding }, ...]
   },
   tasksByParent: {},   // parent_id -> [task,...]
   expanded: {},        // "table:id" -> true
@@ -478,37 +488,101 @@ function computeApTotal() {
   const prTotal = state.apPayrollRuns.reduce((s, r) => s + Number(state.apPayrollNetByRun[r.id] || 0), 0);
   return expTotal + prTotal;
 }
+// AR/AP outstanding have no historical "as of" query anywhere else in the
+// app (loadARAging/loadAPAging only ever fetch what's unpaid right now), so
+// the Finance Dashboard's trend chart reconstructs each month-end snapshot
+// itself from paid_at: an invoice/expense/payroll run counts as outstanding
+// as of date D when it existed by D (invoice_date/expense_date/approved_at
+// <= D) and either was never paid or was paid after D. Expenses/payroll
+// runs use their CURRENT status (Approved), since approval date isn't
+// tracked historically — a fair approximation, and the same one the AP
+// Aging screen itself relies on for "as of today".
+async function loadFinanceTrendHistory(trendMonths) {
+  const [invRes, expRes, prRes] = await Promise.all([
+    sb.from("invoices").select("id,invoice_date,paid_at,wo_id"),
+    sb.from("expenses").select("id,expense_date,paid_at,amount,status"),
+    sb.from("payroll_runs").select("id,approved_at,paid_at,status"),
+  ]);
+  const invoices = invRes.data || [];
+  const expenses = expRes.data || [];
+  const payrollRuns = prRes.data || [];
+  const invIds = invoices.map((i) => i.id);
+  const woIds = [...new Set(invoices.map((i) => i.wo_id).filter(Boolean))];
+  const prIds = payrollRuns.map((r) => r.id);
+  const [tasksRes, wosRes, plRes] = await Promise.all([
+    invIds.length ? sb.from("tasks").select("*").eq("parent_type", "Invoice").in("parent_id", invIds) : Promise.resolve({ data: [] }),
+    woIds.length ? sb.from("work_orders").select("id,discount,accounting_system").in("id", woIds) : Promise.resolve({ data: [] }),
+    prIds.length ? sb.from("payroll_lines").select("payroll_run_id,net_pay").in("payroll_run_id", prIds) : Promise.resolve({ data: [] }),
+  ]);
+  const tasksByInvoice = {};
+  (tasksRes.data || []).forEach((t) => (tasksByInvoice[t.parent_id] = tasksByInvoice[t.parent_id] || []).push(t));
+  const woById = {};
+  (wosRes.data || []).forEach((w) => { woById[w.id] = w; });
+  const netByRun = {};
+  (plRes.data || []).forEach((l) => { netByRun[l.payroll_run_id] = (netByRun[l.payroll_run_id] || 0) + Number(l.net_pay || 0); });
+  const outstandingAsOf = (dateStr, paidAt) => !paidAt || paidAt.slice(0, 10) > dateStr;
+
+  return trendMonths.map((m) => {
+    const asOf = m.end;
+    const arOutstanding = invoices
+      .filter((inv) => inv.invoice_date <= asOf && outstandingAsOf(asOf, inv.paid_at))
+      .reduce((s, inv) => {
+        const wo = woById[inv.wo_id] || {};
+        return s + taskTotals(tasksByInvoice[inv.id] || [], wo.discount, wo.accounting_system).total;
+      }, 0);
+    const apExpenses = expenses
+      .filter((e) => e.status === "Approved" && e.expense_date <= asOf && outstandingAsOf(asOf, e.paid_at))
+      .reduce((s, e) => s + Number(e.amount || 0), 0);
+    const apPayroll = payrollRuns
+      .filter((r) => r.status === "Approved" && r.approved_at && r.approved_at.slice(0, 10) <= asOf && outstandingAsOf(asOf, r.paid_at))
+      .reduce((s, r) => s + Number(netByRun[r.id] || 0), 0);
+    return { arOutstanding, apOutstanding: apExpenses + apPayroll };
+  });
+}
 // The Finance Dashboard: sales/expenses/net-income/net-cash-flow for the
 // selected period, cash and AR/AP outstanding as of today, and a trailing
-// 6-month Sales vs Expenses trend (independent of the period picker, so
+// 6-month trend for all seven KPIs (independent of the period picker, so
 // there's always a "where are we headed" view even for a one-day range).
 async function loadFinanceDashboard() {
   if (!isMgmt()) return;
   const { from, to } = state.statementDates.financedashboard;
   const trendMonths = [5, 4, 3, 2, 1, 0].map((i) => monthBounds(addMonths(to, -i)));
-  const [isRes, cfRes, tbBefore, tbTo, ...trendRes] = await Promise.all([
+  const sumCash = (rows) => (rows || []).filter((r) => r.code && r.code.startsWith("CASH-"))
+    .reduce((s, r) => s + Number(r.debit || 0) - Number(r.credit || 0), 0);
+  const [isRes, cfRes, tbBefore, tbTo, trendHistory, ...rest] = await Promise.all([
     sb.rpc("income_statement", { p_from: from, p_to: to }),
     sb.rpc("cash_flow_statement", { p_from: from, p_to: to }),
     sb.rpc("trial_balance", { p_as_of: dayBefore(from) }),
     sb.rpc("trial_balance", { p_as_of: to }),
+    loadFinanceTrendHistory(trendMonths),
     ...trendMonths.map((m) => sb.rpc("income_statement", { p_from: m.start, p_to: m.end })),
+    ...trendMonths.map((m) => sb.rpc("cash_flow_statement", { p_from: m.start, p_to: m.end })),
+    ...trendMonths.map((m) => sb.rpc("trial_balance", { p_as_of: m.end })),
     loadARAging(),
     loadAPAging(),
   ]);
+  const n = trendMonths.length;
+  const isTrendRes = rest.slice(0, n);
+  const cfTrendRes = rest.slice(n, n * 2);
+  const tbTrendRes = rest.slice(n * 2, n * 3);
   const isRows = isRes.error ? [] : (isRes.data || []);
   const revenue = isRows.filter((r) => r.account_type === "Revenue").reduce((s, r) => s + Number(r.amount || 0), 0);
   const expense = isRows.filter((r) => r.account_type === "Expense").reduce((s, r) => s + Number(r.amount || 0), 0);
   const cfRows = cfRes.error ? [] : (cfRes.data || []);
   const netCashFlow = cfRows.reduce((s, r) => s + Number(r.amount || 0), 0);
-  const sumCash = (rows) => (rows || []).filter((r) => r.code && r.code.startsWith("CASH-"))
-    .reduce((s, r) => s + Number(r.debit || 0) - Number(r.credit || 0), 0);
   const trend = trendMonths.map((m, idx) => {
-    const res = trendRes[idx];
-    const r = res && !res.error ? (res.data || []) : [];
+    const isR = isTrendRes[idx] && !isTrendRes[idx].error ? (isTrendRes[idx].data || []) : [];
+    const cfR = cfTrendRes[idx] && !cfTrendRes[idx].error ? (cfTrendRes[idx].data || []) : [];
+    const tbR = tbTrendRes[idx] && !tbTrendRes[idx].error ? (tbTrendRes[idx].data || []) : [];
+    const rev = isR.filter((x) => x.account_type === "Revenue").reduce((s, x) => s + Number(x.amount || 0), 0);
+    const exp = isR.filter((x) => x.account_type === "Expense").reduce((s, x) => s + Number(x.amount || 0), 0);
     return {
       label: monthLabel(m.start),
-      revenue: r.filter((x) => x.account_type === "Revenue").reduce((s, x) => s + Number(x.amount || 0), 0),
-      expense: r.filter((x) => x.account_type === "Expense").reduce((s, x) => s + Number(x.amount || 0), 0),
+      revenue: rev, expense: exp, netIncome: rev - exp,
+      netCashFlow: cfR.reduce((s, x) => s + Number(x.amount || 0), 0),
+      cashOnHand: sumCash(tbR),
+      arOutstanding: trendHistory[idx].arOutstanding,
+      apOutstanding: trendHistory[idx].apOutstanding,
     };
   });
   state.financeDashboard = {
@@ -1151,6 +1225,50 @@ App.toggleCoaGroup = function (type) {
   state.coaCollapsed[type] = !state.coaCollapsed[type];
   render();
 };
+App.startEditChartAccount = function (code) {
+  state.coaEditingCode = code;
+  render();
+};
+App.cancelEditChartAccount = function () {
+  state.coaEditingCode = null;
+  render();
+};
+App.saveChartAccount = async function (code) {
+  const nameInput = document.getElementById(`coaEditName-${code}`);
+  const typeSelect = document.getElementById(`coaEditType-${code}`);
+  const name = ((nameInput && nameInput.value) || "").trim();
+  const account_type = typeSelect && typeSelect.value;
+  if (!name) { showToast("Account name is required", true); return; }
+  if (!account_type) { showToast("Pick an account type", true); return; }
+  await guard(sb.from("chart_of_accounts").update({ name, account_type }).eq("code", code), "Account updated");
+  state.coaEditingCode = null;
+  await loadLedger();
+  render();
+};
+// Deleting an account is blocked in two ways: system-critical codes that
+// trigger functions post to directly are never offered Delete at all (see
+// SYSTEM_ACCOUNT_CODES); anything else is checked here for existing
+// journal_lines or expenses referencing it first, since journal_lines has
+// no FK to enforce that itself (see the 024 migration's comment).
+App.deleteChartAccount = async function (code, name) {
+  if (SYSTEM_ACCOUNT_CODES.includes(code)) {
+    showToast("This account is used automatically by the system and can't be deleted", true);
+    return;
+  }
+  const [jlRes, expRes] = await Promise.all([
+    sb.from("journal_lines").select("id", { count: "exact", head: true }).eq("account_code", code),
+    sb.from("expenses").select("id", { count: "exact", head: true }).eq("account_code", code),
+  ]);
+  const txnCount = (jlRes.count || 0) + (expRes.count || 0);
+  if (txnCount > 0) {
+    showToast(`Can't delete "${name}" — ${txnCount} transaction${txnCount === 1 ? "" : "s"} reference it`, true);
+    return;
+  }
+  if (!confirm(`Delete "${name}" (${code})? This can't be undone.`)) return;
+  await guard(sb.from("chart_of_accounts").delete().eq("code", code), "Account deleted");
+  await loadLedger();
+  render();
+};
 App.exportChartOfAccounts = function () {
   exportRowsToExcel(`chart-of-accounts-${todayStamp()}.xlsx`, [
     { name: "Chart of Accounts", rows: state.accountBalances.slice().sort((a, b) => a.code.localeCompare(b.code)).map((a) => ({
@@ -1395,6 +1513,29 @@ const FINANCE_DASH_PRESETS = [
   { id: "thisquarter", label: "This quarter" },
   { id: "thisyear", label: "This year" },
 ];
+// The 7 KPI tiles on the Finance Dashboard double as a trend-chart legend:
+// clicking one toggles its line on the trailing-6-month chart below. `key`
+// matches both the field on state.financeDashboard and on each state.financeDashboard.trend[i].
+const FINANCE_KPI_METRICS = [
+  { key: "revenue", label: "Sales", color: "#0e7a4d" },
+  { key: "expense", label: "Expenses", color: "#b3261e" },
+  { key: "netIncome", label: "Net income", color: "#2563eb" },
+  { key: "netCashFlow", label: "Net cash flow", color: "#92650a" },
+  { key: "cashOnHand", label: "Cash on hand", color: "#0d9488" },
+  { key: "arOutstanding", label: "AR outstanding", color: "#7c3aed" },
+  { key: "apOutstanding", label: "AP outstanding", color: "#475467" },
+];
+App.toggleFinanceMetric = function (key) {
+  const sel = state.financeDashboardMetrics;
+  const idx = sel.indexOf(key);
+  if (idx >= 0) {
+    if (sel.length === 1) return; // keep at least one line on the chart
+    sel.splice(idx, 1);
+  } else {
+    sel.push(key);
+  }
+  render();
+};
 App.setFinanceDashboardDate = function (field, value) {
   state.statementDates.financedashboard[field] = value;
   state.financeDashboardPreset = "custom";
@@ -1431,7 +1572,11 @@ App.exportFinanceDashboard = function () {
     { Metric: "AR outstanding (as of today)", "Amount (SAR)": d.arTotal },
     { Metric: "AP outstanding (as of today)", "Amount (SAR)": d.apTotal },
   ];
-  const trend = d.trend.map((m) => ({ Month: m.label, Sales: m.revenue, Expenses: m.expense, "Net": m.revenue - m.expense }));
+  const trend = d.trend.map((m) => ({
+    Month: m.label, Sales: m.revenue, Expenses: m.expense, "Net income": m.netIncome,
+    "Net cash flow": m.netCashFlow, "Cash on hand": m.cashOnHand,
+    "AR outstanding": m.arOutstanding, "AP outstanding": m.apOutstanding,
+  }));
   exportRowsToExcel(`finance-dashboard-${from}-to-${to}.xlsx`, [
     { name: "Summary", rows: summary },
     { name: "6-Month Trend", rows: trend },
@@ -2212,7 +2357,7 @@ function renderChartOfAccounts() {
   const coaTypeLabel = (t) => (t === "ContraAsset" ? "Contra-Asset" : t === "ContraEquity" ? "Contra-Equity" : t);
   return `
   <h2 class="page-title">Chart of Accounts</h2>
-  <p class="page-sub">Every account everything else in Finance posts against, grouped by type — click a group to collapse it. Balances are live, as of right now.${owner ? "" : " Only the Owner can add or rename accounts."}</p>
+  <p class="page-sub">Every account everything else in Finance posts against, grouped by type — click a group to collapse it. Balances are live, as of right now.${owner ? " Accounts the system posts to automatically are marked (system) and can be renamed or retyped but not deleted; any other account can be deleted once it has no transactions against it." : " Only the Owner can add, edit or delete accounts."}</p>
   ${owner ? `
   <div class="card">
     <h3>Add account</h3>
@@ -2250,12 +2395,37 @@ function renderChartOfAccounts() {
         <table>
           <thead><tr><th>Code</th><th>Account</th><th class="right">Balance (SAR)</th><th></th></tr></thead>
           <tbody>
-            ${g.accounts.length ? g.accounts.map((a) => `
+            ${g.accounts.length ? g.accounts.map((a) => {
+              const isSystem = SYSTEM_ACCOUNT_CODES.includes(a.code);
+              if (owner && state.coaEditingCode === a.code) {
+                return `
+              <tr class="coa-edit-row">
+                <td>${esc(a.code)}</td>
+                <td><input id="coaEditName-${esc(a.code)}" value="${esc(a.name)}" style="width:100%"></td>
+                <td class="right">
+                  <select id="coaEditType-${esc(a.code)}" style="width:100%">
+                    ${ACCOUNT_TYPES.map((t) => `<option value="${t}" ${t === a.account_type ? "selected" : ""}>${esc(coaTypeLabel(t))}</option>`).join("")}
+                  </select>
+                </td>
+                <td style="white-space:nowrap">
+                  <button class="link-btn" onclick="App.saveChartAccount('${a.code}')">save</button>
+                  &nbsp;·&nbsp;
+                  <button class="link-btn" onclick="App.cancelEditChartAccount()">cancel</button>
+                </td>
+              </tr>`;
+              }
+              return `
               <tr>
-                <td>${esc(a.code)}</td><td>${esc(a.name)}</td>
+                <td>${esc(a.code)}</td><td>${esc(a.name)}${isSystem ? ` <span class="subtle">(system)</span>` : ""}</td>
                 <td class="right">${fmtMoney(a.balance)}</td>
-                <td><button class="link-btn" onclick="App.viewAccountLedger('${a.code}')">view ledger</button></td>
-              </tr>`).join("") : `<tr><td colspan="4" class="empty-state">No accounts of this type${searching ? " match this search" : ""}.</td></tr>`}
+                <td style="white-space:nowrap">
+                  <button class="link-btn" onclick="App.viewAccountLedger('${a.code}')">view ledger</button>
+                  ${owner ? `
+                  &nbsp;·&nbsp;<button class="link-btn" onclick="App.startEditChartAccount('${a.code}')">edit</button>
+                  ${isSystem ? "" : `&nbsp;·&nbsp;<button class="link-btn danger" onclick="App.deleteChartAccount('${a.code}','${esc(a.name).replace(/'/g, "&#39;")}')">delete</button>`}` : ""}
+                </td>
+              </tr>`;
+            }).join("") : `<tr><td colspan="4" class="empty-state">No accounts of this type${searching ? " match this search" : ""}.</td></tr>`}
           </tbody>
         </table>`}
       </div>`;
@@ -2423,25 +2593,32 @@ function renderGeneralLedger() {
 
 // ------------------------------------------------------------ Finance Dashboard
 
-function renderTrendChart(trend) {
-  const maxVal = Math.max(1, ...trend.flatMap((m) => [Number(m.revenue) || 0, Number(m.expense) || 0]));
-  const groupW = 100, barW = 26, gap = 8, chartH = 140, baseY = 160;
-  const offset = (groupW - (barW * 2 + gap)) / 2;
-  const bars = trend.map((m, i) => {
-    const gx = 40 + i * groupW;
-    const revH = Math.round((Number(m.revenue) / maxVal) * chartH);
-    const expH = Math.round((Number(m.expense) / maxVal) * chartH);
-    const revX = gx + offset, expX = revX + barW + gap;
-    return `
-      <g>
-        <rect x="${revX}" y="${baseY - revH}" width="${barW}" height="${Math.max(revH, 0)}" rx="3" fill="var(--green)"><title>${esc(m.label)} sales: ${fmtMoney(m.revenue)}</title></rect>
-        <rect x="${expX}" y="${baseY - expH}" width="${barW}" height="${Math.max(expH, 0)}" rx="3" fill="var(--red)"><title>${esc(m.label)} expenses: ${fmtMoney(m.expense)}</title></rect>
-        <text x="${gx + groupW / 2}" y="${baseY + 18}" text-anchor="middle" font-size="11" fill="var(--muted)">${esc(m.label)}</text>
-      </g>`;
+// Renders a multi-line chart, one line per selected KPI, sharing a single
+// scale — that's what lets "select Sales and Expenses" and "select Cash on
+// hand too" all land on one comparable chart, per the KPI tiles' selection.
+function renderTrendChart(trend, selectedKeys) {
+  const metrics = FINANCE_KPI_METRICS.filter((m) => selectedKeys.includes(m.key));
+  const allVals = trend.flatMap((m) => metrics.map((k) => Number(m[k.key]) || 0));
+  const maxVal = Math.max(1, ...allVals);
+  const minVal = Math.min(0, ...allVals);
+  const range = Math.max(1, maxVal - minVal);
+  const top = 16, chartH = 140, left = 44, right = 620;
+  const n = Math.max(1, trend.length);
+  const stepX = trend.length > 1 ? (right - left) / (trend.length - 1) : 0;
+  const xAt = (i) => left + i * stepX;
+  const yAt = (v) => top + chartH - ((v - minVal) / range) * chartH;
+  const zeroY = yAt(0);
+  const lines = metrics.map((metric) => {
+    const pts = trend.map((m, i) => [xAt(i), yAt(Number(m[metric.key]) || 0)]);
+    const path = pts.map(([x, y], i) => `${i === 0 ? "M" : "L"}${x.toFixed(1)},${y.toFixed(1)}`).join(" ");
+    const dots = pts.map(([x, y], i) => `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="3.2" fill="${metric.color}"><title>${esc(trend[i].label)} — ${esc(metric.label)}: ${fmtMoney(trend[i][metric.key])}</title></circle>`).join("");
+    return `<path d="${path}" fill="none" stroke="${metric.color}" stroke-width="2.25" stroke-linejoin="round" stroke-linecap="round"/>${dots}`;
   }).join("");
-  return `<svg viewBox="0 0 640 190" width="100%" style="max-width:640px;display:block" role="img" aria-label="Sales vs expenses, trailing 6 months">
-    <line x1="40" y1="${baseY}" x2="620" y2="${baseY}" stroke="var(--border)" stroke-width="1"/>
-    ${bars}
+  const xLabels = trend.map((m, i) => `<text x="${xAt(i).toFixed(1)}" y="${top + chartH + 18}" text-anchor="middle" font-size="11" fill="var(--muted)">${esc(m.label)}</text>`).join("");
+  return `<svg viewBox="0 0 660 190" width="100%" style="max-width:660px;display:block" role="img" aria-label="Trailing 6-month trend for ${esc(metrics.map((m) => m.label).join(", "))}">
+    <line x1="${left}" y1="${zeroY.toFixed(1)}" x2="${right}" y2="${zeroY.toFixed(1)}" stroke="var(--border)" stroke-width="1"/>
+    ${lines}
+    ${xLabels}
   </svg>`;
 }
 
@@ -2449,9 +2626,23 @@ function renderFinanceDashboard() {
   const { from, to } = state.statementDates.financedashboard;
   const d = state.financeDashboard;
   const preset = state.financeDashboardPreset;
+  const selected = state.financeDashboardMetrics;
+  const currentValue = {
+    revenue: d.revenue, expense: d.expense, netIncome: d.netIncome, netCashFlow: d.netCashFlow,
+    cashOnHand: d.endCash, arOutstanding: d.arTotal, apOutstanding: d.apTotal,
+  };
+  const hint = {
+    revenue: `${fmtDate(from)} – ${fmtDate(to)}`, expense: `${fmtDate(from)} – ${fmtDate(to)}`,
+    netIncome: "Sales minus expenses", netCashFlow: "Cash in minus cash out",
+    cashOnHand: `As of ${fmtDate(to)}`, arOutstanding: "Unpaid invoices, as of today",
+    apOutstanding: "Owed to vendors & payroll, as of today",
+  };
+  const chartTitle = selected.length <= 3
+    ? `${FINANCE_KPI_METRICS.filter((m) => selected.includes(m.key)).map((m) => m.label).join(" vs ")} — trailing 6 months`
+    : `${selected.length} metrics compared — trailing 6 months`;
   return `
   <h2 class="page-title">Finance Dashboard</h2>
-  <p class="page-sub">Sales, expenses and cash flow for the selected period, plus cash and AR/AP outstanding as of today.</p>
+  <p class="page-sub">Sales, expenses and cash flow for the selected period, plus cash and AR/AP outstanding as of today. Click any tile below to plot it on the chart — click more than one to compare them on the same chart.</p>
   <div class="card">
     <form class="statement-meta" onsubmit="return App.runFinanceDashboard(event)">
       <div class="dash-presets">
@@ -2464,18 +2655,25 @@ function renderFinanceDashboard() {
     </form>
   </div>
   <div class="kpi-grid">
-    <div class="kpi accent"><div class="label">Sales</div><div class="value">${fmtMoney(d.revenue)}</div><div class="hint">${fmtDate(from)} – ${fmtDate(to)}</div></div>
-    <div class="kpi"><div class="label">Expenses</div><div class="value">${fmtMoney(d.expense)}</div><div class="hint">${fmtDate(from)} – ${fmtDate(to)}</div></div>
-    <div class="kpi ${d.netIncome < 0 ? "negative" : ""}"><div class="label">Net income</div><div class="value">${fmtMoney(d.netIncome)}</div><div class="hint">Sales minus expenses</div></div>
-    <div class="kpi ${d.netCashFlow < 0 ? "negative" : ""}"><div class="label">Net cash flow</div><div class="value">${fmtMoney(d.netCashFlow)}</div><div class="hint">Cash in minus cash out</div></div>
-    <div class="kpi"><div class="label">Cash on hand</div><div class="value">${fmtMoney(d.endCash)}</div><div class="hint">As of ${fmtDate(to)}</div></div>
-    <div class="kpi"><div class="label">AR outstanding</div><div class="value">${fmtMoney(d.arTotal)}</div><div class="hint">Unpaid invoices, as of today</div></div>
-    <div class="kpi"><div class="label">AP outstanding</div><div class="value">${fmtMoney(d.apTotal)}</div><div class="hint">Owed to vendors &amp; payroll, as of today</div></div>
+    ${FINANCE_KPI_METRICS.map((m) => {
+      const value = currentValue[m.key];
+      const isNeg = (m.key === "netIncome" || m.key === "netCashFlow") && value < 0;
+      const isSel = selected.includes(m.key);
+      return `
+    <div class="kpi clickable ${isSel ? "selected" : ""} ${isNeg ? "negative" : ""}" style="--kpi-color:${m.color}" onclick="App.toggleFinanceMetric('${m.key}')">
+      <div class="label">${esc(m.label)}</div>
+      <div class="value">${fmtMoney(value)}</div>
+      <div class="hint">${esc(hint[m.key])}</div>
+    </div>`;
+    }).join("")}
   </div>
   <div class="card trend-card">
-    <h3 style="margin:0 0 4px;font-size:14px;color:var(--ink)">Sales vs expenses — trailing 6 months</h3>
-    <div class="trend-legend"><span><span class="dot" style="background:var(--green)"></span>Sales</span><span><span class="dot" style="background:var(--red)"></span>Expenses</span></div>
-    ${renderTrendChart(d.trend)}
+    <h3 style="margin:0 0 4px;font-size:14px;color:var(--ink)">${esc(chartTitle)}</h3>
+    <div class="trend-legend">
+      ${FINANCE_KPI_METRICS.filter((m) => selected.includes(m.key)).map((m) => `
+        <button type="button" class="leg-item active" style="color:${m.color}" onclick="App.toggleFinanceMetric('${m.key}')"><span class="dot" style="background:${m.color}"></span>${esc(m.label)}</button>`).join("")}
+    </div>
+    ${renderTrendChart(d.trend, selected)}
   </div>`;
 }
 
