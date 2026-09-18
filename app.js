@@ -67,7 +67,6 @@ const MODULES = {
     tabs: [
       { id: "dashboard", label: "Dashboard" },
       { id: "customers", label: "Customers" },
-      { id: "inquiries", label: "Inquiries" },
       { id: "quotations", label: "Quotations" },
       { id: "workorders", label: "Work Orders" },
       { id: "invoices", label: "Invoices" },
@@ -416,6 +415,178 @@ function todayStamp() {
   return new Date().toISOString().slice(0, 10);
 }
 
+// ------------------------------------------------------------- PDF export
+//
+// Quotations and Invoices can each be downloaded as a branded, bilingual
+// PDF matching the company's real letterhead. It's built client-side: a
+// throwaway off-screen element is styled to look exactly like the printed
+// document, html2canvas rasterizes it (so Arabic text gets real browser
+// text-shaping instead of hand-drawn glyphs, which jsPDF alone can't do),
+// and jsPDF drops that image onto an A4 page. Needs the html2canvas/jsPDF/
+// qrcode UMD builds loaded from index.html.
+
+// This business's own fixed letterhead — the same on every document, so
+// it's hardcoded rather than pulled from anywhere editable.
+const COMPANY_INFO = {
+  nameEn: "ServTech Company",
+  nameAr: "شركة سيرفتيك",
+  addressAr: [
+    "الشارع الفرزدق, الحي حي الضباط 6759",
+    "الرقم الفرعي 4276, RCTA 6759 :العنوان المختصر",
+    "الرياض, المملكة العربية السعودية 12627",
+  ],
+  vatNumber: "314557079700003",
+  crNumber: "7053343815",
+  website: "www.servtech.sa",
+  emails: "accounts@servtech.sa | sales@servtech.sa",
+  phone: "+966538547491",
+};
+
+// Builds the Saudi ZATCA "Phase 1" simplified tax-invoice QR payload: a
+// base64 string of 5 TLV (tag-length-value) fields — seller name, VAT
+// number, ISO timestamp, invoice total incl. VAT, VAT total — the same
+// format ZATCA's own verification apps decode.
+function zatcaQrBase64(sellerName, vatNumber, isoTimestamp, totalInclVat, vatTotal) {
+  function tlv(tag, value) {
+    const bytes = new TextEncoder().encode(String(value));
+    return new Uint8Array([tag, bytes.length, ...bytes]);
+  }
+  const parts = [
+    tlv(1, sellerName), tlv(2, vatNumber), tlv(3, isoTimestamp),
+    tlv(4, Number(totalInclVat).toFixed(2)), tlv(5, Number(vatTotal).toFixed(2)),
+  ];
+  const total = parts.reduce((s, p) => s + p.length, 0);
+  const buf = new Uint8Array(total);
+  let off = 0;
+  parts.forEach((p) => { buf.set(p, off); off += p.length; });
+  let bin = "";
+  buf.forEach((b) => { bin += String.fromCharCode(b); });
+  return btoa(bin);
+}
+
+// Renders `html` (a self-contained fragment) off-screen, captures it with
+// html2canvas and drops the result into a multi-page-safe A4 PDF.
+async function renderHtmlToPdf(html, filename) {
+  if (typeof html2canvas === "undefined" || !window.jspdf) {
+    showToast("PDF export isn't available right now — try reloading the page", true);
+    return;
+  }
+  const host = document.createElement("div");
+  host.style.cssText = "position:fixed;left:-10000px;top:0;width:794px;background:#fff;";
+  host.innerHTML = html;
+  document.body.appendChild(host);
+  try {
+    await new Promise((r) => setTimeout(r, 120)); // let webfonts/the QR image settle
+    const canvas = await html2canvas(host, { scale: 2, useCORS: true, backgroundColor: "#ffffff", width: 794 });
+    const imgData = canvas.toDataURL("image/png");
+    const { jsPDF } = window.jspdf;
+    const pdf = new jsPDF({ orientation: "portrait", unit: "mm", format: "a4" });
+    const pageWidth = pdf.internal.pageSize.getWidth();
+    const pageHeight = pdf.internal.pageSize.getHeight();
+    const imgWidth = pageWidth;
+    const imgHeight = (canvas.height * imgWidth) / canvas.width;
+    let heightLeft = imgHeight, position = 0;
+    pdf.addImage(imgData, "PNG", 0, position, imgWidth, imgHeight);
+    heightLeft -= pageHeight;
+    while (heightLeft > 0) {
+      position -= pageHeight;
+      pdf.addPage();
+      pdf.addImage(imgData, "PNG", 0, position, imgWidth, imgHeight);
+      heightLeft -= pageHeight;
+    }
+    pdf.save(filename);
+  } catch (e) {
+    showToast("Couldn't build the PDF — " + (e.message || "try again"), true);
+  } finally {
+    document.body.removeChild(host);
+  }
+}
+
+// Shared layout for both the Quotation and Invoice PDFs — same letterhead,
+// same itemized table, same totals box — with `opts` swapping in what
+// differs between the two (title, date columns, and whatever goes in the
+// bottom-left: a payment/QR block for an invoice, a validity note for a
+// quotation).
+function buildDocPdfHtml(opts) {
+  const {
+    docTypeLabel, docNumber, buyerName, buyerAddrLines, buyerVat,
+    dateCols, rows, rate, taxable, vatTotal, gross,
+    taxableLabel, grossLabel, extraTotalRows, bottomLeftHtml,
+  } = opts;
+  const logoImg = LOGO_MARK.replace('class="logo-badge"', 'style="width:60px;height:60px;border-radius:50%;object-fit:cover;display:block;flex-shrink:0;"');
+  const rowsHtml = rows.map((r) => `
+    <tr>
+      <td style="padding:9px 8px;border-bottom:1px solid #e8edf3;">${esc(r.description)}</td>
+      <td style="padding:9px 8px;border-bottom:1px solid #e8edf3;text-align:right;">1.00</td>
+      <td style="padding:9px 8px;border-bottom:1px solid #e8edf3;text-align:right;">${fmtMoney(r.unit)} SR</td>
+      <td style="padding:9px 8px;border-bottom:1px solid #e8edf3;text-align:right;">${rate > 0 ? "15%" : "—"}</td>
+      <td style="padding:9px 8px;border-bottom:1px solid #e8edf3;text-align:right;">${fmtMoney(r.vat)} SR</td>
+      <td style="padding:9px 8px;border-bottom:1px solid #e8edf3;text-align:right;">${fmtMoney(r.unit)} SR</td>
+      <td style="padding:9px 8px;border-bottom:1px solid #e8edf3;text-align:right;">${fmtMoney(r.unit + r.vat)} SR</td>
+    </tr>`).join("");
+  const dateColsHtml = dateCols.map((c) => `
+    <div><div style="font-weight:700;color:#1c5da4;font-size:10.5px;">${esc(c.label)}</div><div style="font-size:12px;margin-top:3px;">${esc(c.value)}</div></div>`).join("");
+  return `
+  <div style="font-family:'Tajawal','Inter',sans-serif;color:#1c2733;width:794px;">
+    <div style="display:flex;justify-content:space-between;align-items:flex-start;padding:26px 34px;background:#eef4fb;">
+      ${logoImg}
+      <div style="text-align:right;margin-left:20px;">
+        <div style="font-size:19px;font-weight:800;color:#1c5da4;">${esc(COMPANY_INFO.nameEn)} <span dir="rtl">${COMPANY_INFO.nameAr}</span></div>
+        <div dir="rtl" style="font-size:10.5px;color:#4b5a6b;margin-top:8px;line-height:1.7;">${COMPANY_INFO.addressAr.join("<br>")}</div>
+        <div style="font-size:10.5px;color:#4b5a6b;margin-top:4px;">VAT Number: ${COMPANY_INFO.vatNumber}</div>
+        <div style="font-size:10.5px;color:#4b5a6b;">Commercial Registration Number: ${COMPANY_INFO.crNumber}</div>
+      </div>
+    </div>
+    <div style="padding:22px 34px 0;">
+      <div style="font-size:21px;font-weight:600;color:#1c5da4;margin-bottom:16px;">${esc(docTypeLabel)} ${esc(docNumber)}</div>
+      <div style="font-size:12px;line-height:1.8;">
+        <div style="font-weight:700;">${esc(buyerName)}</div>
+        ${buyerAddrLines.map((l) => `<div>${esc(l)}</div>`).join("")}
+        <div>VAT Number: ${esc(buyerVat || "—")}</div>
+      </div>
+      <div style="display:flex;gap:36px;margin-top:22px;padding-bottom:16px;border-bottom:1px solid #e8edf3;">${dateColsHtml}</div>
+      <table style="width:100%;border-collapse:collapse;margin-top:18px;font-size:11.5px;">
+        <thead><tr style="background:#1c5da4;color:#fff;">
+          <th style="padding:9px 8px;text-align:left;font-weight:600;">Description</th>
+          <th style="padding:9px 8px;text-align:right;font-weight:600;">Quantity</th>
+          <th style="padding:9px 8px;text-align:right;font-weight:600;">Unit Price</th>
+          <th style="padding:9px 8px;text-align:right;font-weight:600;">Taxes</th>
+          <th style="padding:9px 8px;text-align:right;font-weight:600;">VAT Amount</th>
+          <th style="padding:9px 8px;text-align:right;font-weight:600;">Subtotal<br>(Exclusive of VAT)</th>
+          <th style="padding:9px 8px;text-align:right;font-weight:600;">Subtotal<br>(Inclusive of VAT)</th>
+        </tr></thead>
+        <tbody>${rowsHtml}</tbody>
+      </table>
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-top:26px;gap:24px;">
+        <div style="flex:1;font-size:11.5px;">${bottomLeftHtml}</div>
+        <table style="width:330px;border-collapse:collapse;font-size:12px;flex-shrink:0;">
+          <tr><td style="padding:9px 10px;border:1px solid #dde5ee;">${esc(taxableLabel)}</td><td style="padding:9px 10px;border:1px solid #dde5ee;text-align:right;">${fmtMoney(taxable)} SR</td></tr>
+          <tr><td style="padding:9px 10px;border:1px solid #dde5ee;">VAT Total Amount</td><td style="padding:9px 10px;border:1px solid #dde5ee;text-align:right;">${fmtMoney(vatTotal)} SR</td></tr>
+          <tr style="background:#1c5da4;color:#fff;font-weight:700;"><td style="padding:9px 10px;border:1px solid #dde5ee;">${esc(grossLabel)}</td><td style="padding:9px 10px;border:1px solid #dde5ee;text-align:right;">${fmtMoney(gross)} SR</td></tr>
+          ${extraTotalRows || ""}
+        </table>
+      </div>
+    </div>
+    <div style="display:flex;justify-content:space-between;padding:22px 34px;margin-top:30px;border-top:1px solid #e8edf3;font-size:10px;color:#7a8a9b;">
+      <div>${COMPANY_INFO.website} | ${COMPANY_INFO.emails} | ${COMPANY_INFO.phone}</div>
+      <div style="text-align:right;">${fmtDateTime(new Date().toISOString())}<br>Page 1 / 1</div>
+    </div>
+  </div>`;
+}
+// Turns a customer row into the two address lines the letterhead uses.
+function buyerAddressLines(c) {
+  if (!c) return [];
+  return [
+    [c.building_no, c.street, c.district].filter(Boolean).join(", "),
+    [c.postal_code, c.city, c.state, c.country].filter(Boolean).join(", "),
+  ].filter(Boolean);
+}
+function totalsRowHtml(label, value, opts) {
+  const st = opts && opts.strong ? "font-weight:700;" : (opts && opts.italic ? "font-style:italic;" : "");
+  return `<tr><td style="padding:9px 10px;border:1px solid #dde5ee;${st}">${esc(label)}</td><td style="padding:9px 10px;border:1px solid #dde5ee;text-align:right;${st}">${fmtMoney(value)} SR</td></tr>`;
+}
+
+
 // ------------------------------------------------------------- data loads
 
 async function loadCustomers() {
@@ -738,14 +909,12 @@ async function loadFixedAssets() {
   if (!error) state.fixedAssets = data || [];
 }
 async function loadDashboardKpis() {
-  const [openInq, pendingQ, inProcessWO, unpaidInv] = await Promise.all([
-    sb.from("inquiries").select("id", { count: "exact", head: true }).is("quote_id", null).is("wo_id", null),
+  const [pendingQ, inProcessWO, unpaidInv] = await Promise.all([
     sb.from("quotations").select("id", { count: "exact", head: true }).eq("status", "Pending"),
     sb.from("work_orders").select("id", { count: "exact", head: true }).in("status", ["In Process", "Completed"]).eq("cancelled", false),
     sb.from("invoices").select("id", { count: "exact", head: true }).eq("payment_status", "Unpaid"),
   ]);
   const kpis = {
-    openInquiries: openInq.count || 0,
     pendingQuotations: pendingQ.count || 0,
     workOrdersOpen: inProcessWO.count || 0,
     unpaidInvoices: unpaidInv.count || 0,
@@ -764,7 +933,6 @@ async function loadView(view) {
   try {
     if (view === "dashboard") await loadDashboardKpis();
     if (view === "customers") await loadCustomers();
-    if (view === "inquiries") await Promise.all([loadInquiries(), state.customers.length ? null : loadCustomers()]);
     if (view === "quotations") await Promise.all([loadQuotations(), state.customers.length ? null : loadCustomers()]);
     if (view === "workorders") await Promise.all([loadWorkOrders(), state.customers.length ? null : loadCustomers()]);
     if (view === "invoices") { await Promise.all([loadInvoices(), loadBankAccounts(), loadCashCollections()]); await loadInvoiceTasks(); }
@@ -1147,8 +1315,16 @@ App.pickInquiryCustomer = function (id) {
   render(); // re-render to show/clear that customer's info-on-file panel
 };
 
-App.addInquiry = async function (ev) {
-  ev.preventDefault();
+// The sales-intake box (customer + every service they're asking about) now
+// creates AND converts in one step — there's no separate "Inquiry" screen
+// to visit afterward. Under the hood this is still exactly the old two-step
+// flow (insert an inquiry row, then convert it) run back-to-back, so the
+// database's own audit trail and the convert_inquiry_to_* RPCs are
+// untouched — quotations/work_orders.inquiry_id still points at a real
+// inquiries row, it's just that nobody has to see or click through that
+// row as its own step anymore.
+App.submitIntake = async function (ev, kind) {
+  if (ev && ev.preventDefault) ev.preventDefault();
   const d = state.inquiryDraft;
   if (!d.accounting_system) { showToast("Pick an accounting system — Odoo or Zoho — it's what a work order needs before it can be accepted or delivered", true); return false; }
   const items = d.items.filter((it) => (it.description || "").trim() || Number(it.price || 0) > 0 || it.service_type);
@@ -1175,25 +1351,26 @@ App.addInquiry = async function (ev) {
     description: it.description.trim(),
     price: Number(it.price || 0),
     discount: Number(it.discount || 0),
-  }))), "Inquiry added");
+  }))));
+
+  const fn = kind === "quotation" ? "convert_inquiry_to_quotation" : "convert_inquiry_to_work_order";
+  await guard(sb.rpc(fn, { p_inquiry_id: inquiry.id }), kind === "quotation" ? "Quotation created" : "Work order created");
 
   state.inquiryDraft = freshInquiryDraft();
-  await loadInquiries();
+  if (kind === "workorder") {
+    await loadWorkOrders();
+    state.view = "workorders";
+  } else {
+    await loadQuotations();
+  }
   render();
   return false;
-};
-App.convertInquiry = async function (id, kind) {
-  const fn = kind === "quotation" ? "convert_inquiry_to_quotation" : "convert_inquiry_to_work_order";
-  const arg = { p_inquiry_id: id };
-  await guard(sb.rpc(fn, arg), kind === "quotation" ? "Converted to quotation" : "Converted to work order");
-  await loadInquiries();
-  render();
 };
 
 // ------------------------------------------------------------ quotations
 //
-// No standalone "new quotation" form — a quotation only ever comes from
-// accepting a conversion on an Inquiry (App.convertInquiry above).
+// No standalone "new quotation" form — a quotation comes from the intake
+// box above (App.submitIntake).
 
 App.acceptQuotation = async function (id) {
   await guard(sb.rpc("accept_quotation", { p_quote_id: id }), "Quotation accepted — work order created");
@@ -1206,13 +1383,103 @@ App.rejectQuotation = async function (id) {
   render();
 };
 
+// Quotation/Invoice "Download PDF" actions — defined here (after App exists)
+// rather than up near their helper functions, since those helpers are plain
+// functions but these two assign onto the App namespace object.
+App.downloadQuotationPdf = async function (id) {
+  const q = state.quotations.find((x) => x.id === id);
+  if (!q) return;
+  if (!state.tasksByParent[id]) await loadTasksFor(id);
+  const tasks = state.tasksByParent[id] || [];
+  const buyer = q.customer_id ? (await sb.from("customers").select("*").eq("id", q.customer_id).maybeSingle()).data : null;
+  const rate = q.accounting_system === "Odoo" ? VAT_RATE : 0;
+  const t = taskTotals(tasks, q.discount, q.accounting_system);
+  const rows = tasks.map((tk) => {
+    const unit = Number(tk.price || 0) - Number(tk.discount || 0);
+    return { description: tk.description, unit, vat: unit * rate };
+  });
+  const validUntil = (() => {
+    const dt = new Date((q.quote_date || todayStamp()) + "T00:00:00");
+    dt.setDate(dt.getDate() + 30);
+    return dt.toISOString().slice(0, 10);
+  })();
+  const extraTotalRows = Number(q.discount || 0) > 0 ? totalsRowHtml("Order Discount", -Number(q.discount || 0)) : "";
+  const html = buildDocPdfHtml({
+    docTypeLabel: "Quotation", docNumber: q.quote_number,
+    buyerName: buyer ? (buyer.invoice_name || buyer.display_name) : q.customer,
+    buyerAddrLines: buyerAddressLines(buyer), buyerVat: buyer ? buyer.vat_reg_no : "",
+    dateCols: [
+      { label: "Quote Date", value: fmtDate(q.quote_date) },
+      { label: "Valid Until", value: fmtDate(validUntil) },
+      { label: "Accounting System", value: q.accounting_system || "—" },
+      { label: "Status", value: q.status },
+    ],
+    rows, rate, taxable: t.afterDiscount, vatTotal: t.tax, gross: t.total,
+    taxableLabel: "Quotation Taxable Amount", grossLabel: "Quotation Total (Inclusive of VAT)",
+    extraTotalRows,
+    bottomLeftHtml: `This quotation is valid until <b>${fmtDate(validUntil)}</b>.<br>All prices are in Saudi Riyal (SAR)${rate > 0 ? ", and include 15% VAT." : "."}`,
+  });
+  await renderHtmlToPdf(html, `Quotation-${q.quote_number}.pdf`);
+};
+
+App.downloadInvoicePdf = async function (id) {
+  const inv = state.invoices.find((x) => x.id === id);
+  if (!inv) return;
+  const wo = state.workOrders.find((w) => w.id === inv.wo_id);
+  let tasks = state.invoiceTasksByInvoice[id];
+  if (!tasks) {
+    if (!state.tasksByParent[id]) await loadTasksFor(id);
+    tasks = state.tasksByParent[id] || [];
+  }
+  const buyer = inv.customer_id ? (await sb.from("customers").select("*").eq("id", inv.customer_id).maybeSingle()).data : null;
+  const rate = inv.accounting_system === "Odoo" ? VAT_RATE : 0;
+  const t = taskTotals(tasks, wo ? wo.discount : 0, inv.accounting_system);
+  const rows = tasks.map((tk) => {
+    const unit = Number(tk.price || 0) - Number(tk.discount || 0);
+    return { description: tk.description, unit, vat: unit * rate };
+  });
+  const orderDiscount = wo ? Number(wo.discount || 0) : 0;
+  const extraRows = [];
+  if (orderDiscount > 0) extraRows.push(totalsRowHtml("Order Discount", -orderDiscount));
+  if (inv.payment_status === "Paid") {
+    extraRows.push(totalsRowHtml(`Paid on ${fmtDate((inv.paid_at || "").slice(0, 10))}`, t.total, { italic: true }));
+    extraRows.push(totalsRowHtml("Invoice Total Payable Amount", 0, { strong: true }));
+  } else {
+    extraRows.push(totalsRowHtml("Invoice Total Payable Amount", t.total, { strong: true }));
+  }
+  let qrImgHtml = "";
+  try {
+    const qrTimestamp = new Date(inv.paid_at || (inv.invoice_date + "T00:00:00")).toISOString();
+    const qrPayload = zatcaQrBase64(COMPANY_INFO.nameEn, COMPANY_INFO.vatNumber, qrTimestamp, t.total, t.tax);
+    const qrDataUrl = await QRCode.toDataURL(qrPayload, { width: 130, margin: 1 });
+    qrImgHtml = `<img src="${qrDataUrl}" style="width:110px;height:110px;margin-top:12px;">`;
+  } catch (e) { /* the QR is a nice-to-have — never block the PDF over it */ }
+  const html = buildDocPdfHtml({
+    docTypeLabel: "Proforma Invoice", docNumber: inv.invoice_number,
+    buyerName: buyer ? (buyer.invoice_name || buyer.display_name) : inv.customer,
+    buyerAddrLines: buyerAddressLines(buyer), buyerVat: buyer ? buyer.vat_reg_no : "",
+    dateCols: [
+      { label: "Invoice Date", value: fmtDate(inv.invoice_date) },
+      { label: "Due Date", value: fmtDate(inv.invoice_date) },
+      { label: "Supply Date", value: fmtDate(inv.invoice_date) },
+      { label: "Reference", value: wo ? `W.O ${wo.wo_number}` : "—" },
+    ],
+    rows, rate, taxable: t.afterDiscount, vatTotal: t.tax, gross: t.total,
+    taxableLabel: "Invoice Taxable Amount", grossLabel: "Invoice Gross Total (Inclusive of VAT)",
+    extraTotalRows: extraRows.join(""),
+    bottomLeftHtml: `Payment Communication: <b>${esc(inv.invoice_number)}</b><br>on this account: <b>ServTech</b>${qrImgHtml}`,
+  });
+  await renderHtmlToPdf(html, `Invoice-${inv.invoice_number}.pdf`);
+};
+
 // ----------------------------------------------------------- work orders
 //
 // No standalone "new work order" form either — a work order only ever
-// comes from an Inquiry, either directly (App.convertInquiry(id,
-// 'workorder')) or via a Quotation being accepted (App.acceptQuotation
-// above). That's also what keeps a work order from ever appearing with no
-// line items and therefore nothing to set a status on.
+// comes from the sales intake box on the Quotations screen, either
+// directly (App.submitIntake(ev, 'workorder')) or via a Quotation being
+// accepted (App.acceptQuotation above). That's also what keeps a work
+// order from ever appearing with no line items and therefore nothing to
+// set a status on.
 
 App.cancelWorkOrder = async function (id) {
   const reason = prompt("Reason for cancelling this work order:");
@@ -2188,7 +2455,6 @@ function renderView() {
   switch (state.view) {
     case "dashboard": return renderDashboard();
     case "customers": return renderCustomers();
-    case "inquiries": return renderInquiries();
     case "quotations": return renderQuotations();
     case "workorders": return renderWorkOrders();
     case "invoices": return renderInvoices();
@@ -2222,7 +2488,6 @@ function mgmtOnlyView() {
 function renderDashboard() {
   const k = state.dashboardKpis || {};
   const tiles = [
-    ["Open inquiries", k.openInquiries],
     ["Pending quotations", k.pendingQuotations],
     ["Work orders open", k.workOrdersOpen],
     ["Unpaid invoices", k.unpaidInvoices],
@@ -2236,7 +2501,7 @@ function renderDashboard() {
   </div>
   <div class="card">
     <h3>Where to go next</h3>
-    <p class="subtle">New business starts on <b>Inquiries</b>. Convert an inquiry to a <b>Quotation</b> or straight to a <b>Work Order</b>.
+    <p class="subtle">New business starts on <b>Quotations</b> — fill in the customer and services once, then choose <b>Create Quotation</b> if they want a price to consider, or <b>Create Work Order</b> to go straight to the job.
     Mark line items Delivered on a work order and its invoice and revenue posting happen automatically.
     Payments are recorded on <b>Invoices</b>.${isMgmt() ? " Switch to the <b>Finance</b> module above for the chart of accounts, journal entries and every financial statement." : ""}</p>
   </div>`;
@@ -2448,19 +2713,30 @@ function renderNewCustomerFields(d) {
   </div>`;
 }
 
-function renderInquiries() {
+// ---------------------------------------------------------- Quotations
+//
+// This screen is also where every new piece of business starts: when a
+// customer arrives, sales fills in this one box — who they are and every
+// service they're asking about — then picks Create Quotation (if the
+// customer wants a price to consider first) or Create Work Order (if
+// they're placing the order right there). Either button runs
+// App.submitIntake, which saves the box as an Inquiry behind the scenes
+// and immediately converts it — there's no separate "Inquiry" screen to
+// visit or a manual conversion step anymore.
+
+function renderQuotations() {
   if (!state.inquiryDraft) state.inquiryDraft = freshInquiryDraft();
   const d = state.inquiryDraft;
   const pickedCustomer = d.customer_id ? state.customers.find((c) => c.id === d.customer_id) : null;
   const draftTotals = taskTotals(d.items, d.discount, d.accounting_system);
   const canWrite = canOpsWrite();
   return `
-  <h2 class="page-title">Inquiries</h2>
-  <p class="page-sub">Capture the customer and every service they're asking about in one go, then convert it to a quotation or straight to a work order.</p>
+  <h2 class="page-title">Quotations</h2>
+  <p class="page-sub">When a customer arrives, capture who they are and every service they're asking about here, then choose what happens next — a quotation for them to consider, or straight to a work order if they're placing the order now.</p>
   ${canWrite ? `
   <div class="card">
-    <h3>New inquiry</h3>
-    <form onsubmit="return App.addInquiry(event)">
+    <h3>New customer visit</h3>
+    <form onsubmit="return false">
       <div class="form-row">
         <div class="field"><label>Customer on file</label>
           <select onchange="App.pickInquiryCustomer(this.value)">${customerOptions(d.customer_id)}</select>
@@ -2500,7 +2776,10 @@ function renderInquiries() {
 
       <div class="form-row" style="margin-top:14px">
         <div class="field"><label>Overall discount on whole price (SAR)</label><input type="number" step="0.01" min="0" value="${esc(d.discount)}" oninput="App.setDraftField('discount',this.value)"></div>
-        <div class="field" style="flex:0"><label>&nbsp;</label><button class="btn btn-primary" type="submit">Create inquiry</button></div>
+        <div class="field" style="flex:0"><label>&nbsp;</label>
+          <button class="btn btn-ghost" type="button" onclick="App.submitIntake(event,'quotation')">Create quotation</button>
+          <button class="btn btn-primary" type="button" onclick="App.submitIntake(event,'workorder')">Create work order</button>
+        </div>
       </div>
       <div class="totals-line" id="inquiryDraftTotals">Items subtotal (after item discounts): <b>${fmtMoney(draftTotals.subtotal)}</b> &nbsp; Order discount: <b>${fmtMoney(d.discount)}</b> &nbsp;
         VAT (${draftTotals.rate > 0 ? "15%" : "—"}): <b>${fmtMoney(draftTotals.tax)}</b> &nbsp; Total: <b>${fmtMoney(draftTotals.total)}</b></div>
@@ -2508,38 +2787,7 @@ function renderInquiries() {
   </div>` : ""}
   <div class="card">
     <table>
-      <thead><tr><th>No.</th><th>Customer</th><th>Date</th><th>System</th><th>Result</th><th></th></tr></thead>
-      <tbody>
-        ${state.inquiries.length ? state.inquiries.map((q) => {
-          const key = "inquiries:" + q.id;
-          const open = !!state.expanded[key];
-          const resultLabel = q.wo_number ? `WO ${q.wo_number}` : q.quote_number ? `Quote ${q.quote_number}` : pill("Open", "pending");
-          const canConvert = !q.wo_id && !q.quote_id && canWrite;
-          return `
-          <tr class="clickable" onclick="App.toggle('inquiries','${q.id}')">
-            <td>${esc(q.inquiry_number)}</td><td>${esc(q.customer)}</td><td>${fmtDate(q.inquiry_date)}</td>
-            <td>${esc(q.accounting_system) || "—"}</td><td>${resultLabel}</td>
-            <td onclick="event.stopPropagation()">${canConvert ? `
-              <button class="btn btn-ghost btn-sm" onclick="App.convertInquiry('${q.id}','quotation')">To quotation</button>
-              <button class="btn btn-ghost btn-sm" onclick="App.convertInquiry('${q.id}','workorder')">To work order</button>` : ""}
-            </td>
-          </tr>
-          ${open ? `<tr><td colspan="6">${renderTasksEditor("Inquiry", q.id, q.discount, q.accounting_system, false)}</td></tr>` : ""}`;
-        }).join("") : `<tr><td colspan="6" class="empty-state">No inquiries yet.</td></tr>`}
-      </tbody>
-    </table>
-  </div>`;
-}
-
-// ---------------------------------------------------------- Quotations
-
-function renderQuotations() {
-  return `
-  <h2 class="page-title">Quotations</h2>
-  <p class="page-sub">Quotations come from Inquiries — convert an inquiry to a quotation there. Accepting one here creates its work order automatically.</p>
-  <div class="card">
-    <table>
-      <thead><tr><th>No.</th><th>Customer</th><th>Date</th><th>Status</th><th></th></tr></thead>
+      <thead><tr><th>No.</th><th>Customer</th><th>Date</th><th>Status</th><th></th><th></th></tr></thead>
       <tbody>
         ${state.quotations.length ? state.quotations.map((q) => {
           const key = "quotations:" + q.id;
@@ -2552,9 +2800,10 @@ function renderQuotations() {
               <button class="btn btn-ghost btn-sm" onclick="App.acceptQuotation('${q.id}')">Accept</button>
               <button class="btn btn-ghost btn-sm" onclick="App.rejectQuotation('${q.id}')">Reject</button>` : ""}
             </td>
+            <td onclick="event.stopPropagation()"><button class="link-btn" onclick="App.downloadQuotationPdf('${q.id}')">Download PDF</button></td>
           </tr>
-          ${open ? `<tr><td colspan="5">${renderTasksEditor("Quotation", q.id, q.discount, q.accounting_system, false)}</td></tr>` : ""}`;
-        }).join("") : `<tr><td colspan="5" class="empty-state">No quotations yet.</td></tr>`}
+          ${open ? `<tr><td colspan="6">${renderTasksEditor("Quotation", q.id, q.discount, q.accounting_system, false)}</td></tr>` : ""}`;
+        }).join("") : `<tr><td colspan="6" class="empty-state">No quotations yet.</td></tr>`}
       </tbody>
     </table>
   </div>`;
@@ -2686,7 +2935,7 @@ function renderInvoices() {
   <div class="card">
     <div style="display:flex;justify-content:flex-end;margin-bottom:10px"><button class="btn btn-ghost btn-sm" onclick="App.exportInvoices()">Export to Excel</button></div>
     <table>
-      <thead><tr><th>No.</th><th>Work order</th><th>Customer</th><th>Date</th><th class="right">Total (SAR)</th><th>Status</th>${showActionCol ? "<th>Payment</th>" : ""}</tr></thead>
+      <thead><tr><th>No.</th><th>Work order</th><th>Customer</th><th>Date</th><th class="right">Total (SAR)</th><th>Status</th>${showActionCol ? "<th>Payment</th>" : ""}<th></th></tr></thead>
       <tbody>
         ${state.invoices.length ? state.invoices.map((inv) => {
           const wo = state.workOrders.find((w) => w.id === inv.wo_id);
@@ -2698,8 +2947,9 @@ function renderInvoices() {
             <td class="right">${total !== null ? fmtMoney(total) : "—"}</td>
             <td>${pill(inv.payment_status, inv.payment_status === "Paid" ? "paid" : "unpaid")}${inv.paid_at ? `<div class="subtle">${fmtDateTime(inv.paid_at)}</div>` : ""}</td>
             ${showActionCol ? `<td>${renderInvoicePaidCell(inv)}</td>` : ""}
+            <td><button class="link-btn" onclick="App.downloadInvoicePdf('${inv.id}')">Download PDF</button></td>
           </tr>`;
-        }).join("") : `<tr><td colspan="${showActionCol ? 7 : 6}" class="empty-state">No invoices yet.</td></tr>`}
+        }).join("") : `<tr><td colspan="${showActionCol ? 8 : 7}" class="empty-state">No invoices yet.</td></tr>`}
       </tbody>
     </table>
   </div>`;
