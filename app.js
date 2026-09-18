@@ -3469,10 +3469,12 @@ function renderFinanceDashboard() {
       <div class="dash-presets">
         ${FINANCE_DASH_PRESETS.map((p) => `<button type="button" class="btn btn-ghost btn-sm ${preset === p.id ? "active" : ""}" onclick="App.setFinanceDashboardPreset('${p.id}')">${p.label}</button>`).join("")}
       </div>
-      <div class="field"><label>From</label><input type="date" value="${esc(from)}" oninput="App.setFinanceDashboardDate('from',this.value)"></div>
-      <div class="field"><label>To</label><input type="date" value="${esc(to)}" oninput="App.setFinanceDashboardDate('to',this.value)"></div>
-      <div class="field" style="flex:0"><button class="btn btn-ghost btn-sm" type="submit">Run</button></div>
-      <div class="field" style="flex:0"><button class="btn btn-ghost btn-sm" type="button" onclick="App.exportFinanceDashboard()">Export to Excel</button></div>
+      <div class="dash-period-controls">
+        <label class="inline-date-label">From <input type="date" value="${esc(from)}" oninput="App.setFinanceDashboardDate('from',this.value)"></label>
+        <label class="inline-date-label">To <input type="date" value="${esc(to)}" oninput="App.setFinanceDashboardDate('to',this.value)"></label>
+        <button class="btn btn-ghost btn-sm" type="submit">Run</button>
+        <button class="btn btn-ghost btn-sm" type="button" onclick="App.exportFinanceDashboard()">Export to Excel</button>
+      </div>
     </form>
   </div>
   <div class="findash-layout">
