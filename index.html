@@ -160,6 +160,31 @@
   .subnav-item:hover { background: var(--accent-bg); color: var(--accent-dark); }
   .subnav-item.active { background: var(--accent); color: #fff; box-shadow: var(--shadow-xs); }
 
+  /* Finance's grouped screens (Accounting, Invoices & Expenses, Reports, …)
+     are a hover dropdown off the group name, not an always-open row of
+     buttons — hover/focus opens it on desktop; tapping the trigger toggles
+     the .open class for touch devices. */
+  .subnav-dropdown { position: relative; flex: 0 0 auto; }
+  .subnav-dropdown-trigger { display: inline-flex; align-items: center; gap: 4px; background: none; border: 1px solid transparent; color: var(--muted);
+    padding: 7px 12px; border-radius: 99px; cursor: pointer; font-size: 12.5px; font-weight: 600; white-space: nowrap; font-family: inherit;
+    transition: background-color .12s ease, color .12s ease; }
+  .subnav-dropdown-trigger .chev { font-size: 8px; opacity: .55; transition: transform .14s ease; }
+  .subnav-dropdown-trigger:hover { background: var(--accent-bg); color: var(--accent-dark); }
+  .subnav-dropdown-trigger.active { background: var(--accent); color: #fff; }
+  .subnav-dropdown-trigger.active .chev { opacity: .9; }
+  .subnav-dropdown-menu { position: absolute; top: 100%; left: 0; padding-top: 8px; display: none; z-index: 30; }
+  .subnav-dropdown:hover .subnav-dropdown-menu,
+  .subnav-dropdown:focus-within .subnav-dropdown-menu,
+  .subnav-dropdown.open .subnav-dropdown-menu { display: block; }
+  .subnav-dropdown:hover .subnav-dropdown-trigger .chev,
+  .subnav-dropdown.open .subnav-dropdown-trigger .chev { transform: rotate(180deg); }
+  .subnav-dropdown-menu-inner { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius-sm); box-shadow: var(--shadow-md);
+    padding: 6px; min-width: 200px; display: flex; flex-direction: column; gap: 1px; }
+  .subnav-dropdown-item { display: block; width: 100%; text-align: left; background: none; border: none; color: var(--text); padding: 8.5px 11px;
+    border-radius: 7px; cursor: pointer; font-size: 13px; font-weight: 500; font-family: inherit; white-space: nowrap; }
+  .subnav-dropdown-item:hover { background: var(--accent-bg); color: var(--accent-dark); }
+  .subnav-dropdown-item.active { background: var(--accent); color: #fff; font-weight: 600; }
+
   main { max-width: 1180px; width: 100%; margin: 0 auto; padding: 24px 24px 64px; }
 
   /* ---- Narrow screens: sidebar becomes an off-canvas panel (always full
@@ -277,9 +302,34 @@
   .trend-legend button.leg-item.active { opacity: 1; color: var(--text); font-weight: 600; }
   .dash-presets { display: flex; gap: 8px; flex-wrap: wrap; }
   .dash-presets button.active { background: var(--accent); color: #fff; border-color: var(--accent); }
-  .trend-card .trend-legend { display: flex; gap: 18px; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+  .trend-card .trend-legend { display: flex; gap: 18px; font-size: 12px; color: var(--muted); margin-bottom: 6px; flex-wrap: wrap; }
   .trend-card .trend-legend .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 5px; vertical-align: -1px; }
   .trend-card svg text { font-family: inherit; }
+
+  /* ---- Finance Dashboard: a period toolbar up top, then the trend chart
+     (main, left) beside a symmetric column of KPI stat rows (right) — a
+     deliberate two-column layout instead of a grid that could end up with
+     an odd tile alone on its own row. ---- */
+  .findash-toolbar { margin-bottom: 18px; }
+  .findash-toolbar .statement-meta { margin: 0; }
+  .findash-layout { display: grid; grid-template-columns: 1fr 300px; gap: 18px; align-items: start; }
+  .findash-chart-col { margin-bottom: 0; }
+  .findash-kpi-col { display: flex; flex-direction: column; gap: 9px; }
+  .findash-kpi-row { display: flex; align-items: stretch; background: var(--card); border: 1px solid var(--border); border-radius: var(--radius);
+    box-shadow: var(--shadow-xs); overflow: hidden; cursor: pointer; transition: box-shadow .12s ease, transform .1s ease; }
+  .findash-kpi-row:hover { box-shadow: var(--shadow-md); transform: translateY(-1px); }
+  .findash-kpi-row.selected { box-shadow: 0 0 0 2px var(--kpi-color, var(--accent)) inset, var(--shadow-sm); }
+  .findash-kpi-row .stripe { width: 4px; flex: 0 0 auto; background: var(--kpi-color, var(--accent)); }
+  .findash-kpi-row .body { padding: 11px 14px; flex: 1; min-width: 0; }
+  .findash-kpi-row .row-label { font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+  .findash-kpi-row .row-value { font-size: 19px; font-weight: 800; color: var(--ink); font-variant-numeric: tabular-nums; letter-spacing: -.01em; margin-top: 3px; }
+  .findash-kpi-row.negative .row-value { color: var(--red); }
+  .findash-kpi-row .row-hint { font-size: 10.5px; color: var(--muted); margin-top: 2px; }
+  @media (max-width: 980px) {
+    .findash-layout { grid-template-columns: 1fr; }
+    .findash-kpi-col { flex-direction: row; flex-wrap: wrap; }
+    .findash-kpi-row { flex: 1 1 220px; }
+  }
 </style>
 </head>
 <body>

@@ -214,6 +214,7 @@ const state = {
   toast: null,
   sidebarOpen: false, // off-canvas sidebar state on narrow screens — ignored by the CSS above the mobile breakpoint
   sidebarCollapsed: false, // desktop icon-only sidebar toggle — persisted below via localStorage
+  openSubnavGroup: null, // index into the active module's groups[] whose dropdown is force-open (touch fallback — desktop opens on :hover)
 };
 // Remembers the collapsed/expanded sidebar choice across visits. Wrapped in
 // try/catch since localStorage can throw (private browsing, blocked storage)
@@ -925,6 +926,7 @@ App.nav = function (view) {
   state.view = view;
   state.module = moduleForView(view);
   state.sidebarOpen = false; // no-op on desktop (sidebar's always visible there); closes the off-canvas panel on mobile
+  state.openSubnavGroup = null; // close any tapped-open subnav dropdown
   loadView(view);
 };
 App.toggleSidebar = function (v) {
@@ -939,6 +941,21 @@ App.toggleSidebarCollapse = function () {
   try { localStorage.setItem("usst_sidebar_collapsed", state.sidebarCollapsed ? "1" : "0"); } catch (e) {}
   render();
 };
+// The top subnav's grouped dropdowns (Accounting, Invoices & Expenses,
+// Reports, …) open on hover/focus via CSS alone — this is purely the touch
+// fallback, so tapping a group's name on a device with no real hover still
+// opens it. A document-level click-away listener (registered once, below)
+// closes it again on an outside tap.
+App.toggleSubnavGroup = function (gi) {
+  state.openSubnavGroup = state.openSubnavGroup === gi ? null : gi;
+  render();
+};
+document.addEventListener("click", (e) => {
+  if (state.openSubnavGroup !== null && !e.target.closest(".subnav-dropdown")) {
+    state.openSubnavGroup = null;
+    render();
+  }
+});
 // Switching module jumps to that module's first tab. Finance is refused for
 // anyone but Owner/Manager here too — belt and braces on top of the RLS
 // that already blocks every finance table for an Officer.
@@ -2057,8 +2074,13 @@ function renderShell() {
   const modDef = MODULES[mod] || MODULES.operations;
   // The sidebar now holds only identity + the Operations/Finance module
   // switch — every screen *within* the active module lives in this
-  // horizontal top subnav instead (subnavHtml below), grouped into labeled
-  // clusters for Finance the same way the old in-sidebar nav grouped them,
+  // horizontal top subnav instead (subnavHtml below). For Finance, each
+  // labeled cluster (Accounting, Invoices & Expenses, Reports, …) is a
+  // hover dropdown off its group name rather than a row of always-visible
+  // buttons — hovering (or, on touch, tapping) "Accounting" reveals Chart of
+  // Accounts / Journal Entries / General Ledger / Bank Accounts beneath it.
+  // A group left with exactly one screen (Overview → Dashboard) has nothing
+  // to drop down to, so it's just shown as a plain top-level tab. Groups are
   // filtered down to whatever this role may actually reach
   // (financeVisibleTabIds()) — e.g. an Approver only ever sees the
   // "Invoices & Expenses" group, and only Owner sees "Team".
@@ -2070,11 +2092,21 @@ function renderShell() {
     const visibleGroups = modDef.groups
       .map((g) => ({ ...g, tabs: g.tabs.filter((id) => visibleIds.includes(id)) }))
       .filter((g) => g.tabs.length);
-    subnavHtml = visibleGroups.map((g) => `
-      <div class="subnav-group">
-        <span class="subnav-group-label">${esc(g.label)}</span>
-        ${g.tabs.map((id) => `<button class="subnav-item ${state.view === id ? "active" : ""}" onclick="App.nav('${id}')">${esc(tabById[id].label)}</button>`).join("")}
-      </div>`).join("");
+    subnavHtml = visibleGroups.map((g, gi) => {
+      if (g.tabs.length === 1) {
+        const id = g.tabs[0];
+        return `<button class="subnav-item ${state.view === id ? "active" : ""}" onclick="App.nav('${id}')">${esc(tabById[id].label)}</button>`;
+      }
+      const hasActive = g.tabs.includes(state.view);
+      const isOpen = state.openSubnavGroup === gi;
+      return `
+      <div class="subnav-dropdown ${isOpen ? "open" : ""}">
+        <button class="subnav-dropdown-trigger ${hasActive ? "active" : ""}" onclick="event.stopPropagation();App.toggleSubnavGroup(${gi})">${esc(g.label)}<span class="chev">▾</span></button>
+        <div class="subnav-dropdown-menu"><div class="subnav-dropdown-menu-inner">
+          ${g.tabs.map((id) => `<button class="subnav-dropdown-item ${state.view === id ? "active" : ""}" onclick="App.nav('${id}')">${esc(tabById[id].label)}</button>`).join("")}
+        </div></div>
+      </div>`;
+    }).join("");
   } else {
     subnavHtml = modDef.tabs.map((t) =>
       `<button class="subnav-item ${state.view === t.id ? "active" : ""}" onclick="App.nav('${t.id}')">${esc(t.label)}</button>`
@@ -3431,8 +3463,8 @@ function renderFinanceDashboard() {
     : `${selected.length} metrics compared — trailing 6 months`;
   return `
   <h2 class="page-title">Finance Dashboard</h2>
-  <p class="page-sub">Sales, expenses and cash flow for the selected period, plus cash and AR/AP outstanding as of today. Click any tile below to plot it on the chart — click more than one to compare them on the same chart.</p>
-  <div class="card">
+  <p class="page-sub">Sales, expenses and cash flow for the selected period, plus cash and AR/AP outstanding as of today. Click any figure on the right to plot it on the chart — click more than one to compare them on the same chart.</p>
+  <div class="card findash-toolbar">
     <form class="statement-meta" onsubmit="return App.runFinanceDashboard(event)">
       <div class="dash-presets">
         ${FINANCE_DASH_PRESETS.map((p) => `<button type="button" class="btn btn-ghost btn-sm ${preset === p.id ? "active" : ""}" onclick="App.setFinanceDashboardPreset('${p.id}')">${p.label}</button>`).join("")}
@@ -3443,26 +3475,31 @@ function renderFinanceDashboard() {
       <div class="field" style="flex:0"><button class="btn btn-ghost btn-sm" type="button" onclick="App.exportFinanceDashboard()">Export to Excel</button></div>
     </form>
   </div>
-  <div class="kpi-grid">
-    ${FINANCE_KPI_METRICS.map((m) => {
-      const value = currentValue[m.key];
-      const isNeg = (m.key === "netIncome" || m.key === "netCashFlow") && value < 0;
-      const isSel = selected.includes(m.key);
-      return `
-    <div class="kpi clickable ${isSel ? "selected" : ""} ${isNeg ? "negative" : ""}" style="--kpi-color:${m.color}" onclick="App.toggleFinanceMetric('${m.key}')">
-      <div class="label">${esc(m.label)}</div>
-      <div class="value">${fmtMoney(value)}</div>
-      <div class="hint">${esc(hint[m.key])}</div>
-    </div>`;
-    }).join("")}
-  </div>
-  <div class="card trend-card">
-    <h3 style="margin:0 0 4px;font-size:14px;color:var(--ink)">${esc(chartTitle)}</h3>
-    <div class="trend-legend">
-      ${FINANCE_KPI_METRICS.filter((m) => selected.includes(m.key)).map((m) => `
-        <button type="button" class="leg-item active" style="color:${m.color}" onclick="App.toggleFinanceMetric('${m.key}')"><span class="dot" style="background:${m.color}"></span>${esc(m.label)}</button>`).join("")}
+  <div class="findash-layout">
+    <div class="card trend-card findash-chart-col">
+      <h3 style="margin:0 0 4px;font-size:14px;color:var(--ink)">${esc(chartTitle)}</h3>
+      <div class="trend-legend">
+        ${FINANCE_KPI_METRICS.filter((m) => selected.includes(m.key)).map((m) => `
+          <button type="button" class="leg-item active" style="color:${m.color}" onclick="App.toggleFinanceMetric('${m.key}')"><span class="dot" style="background:${m.color}"></span>${esc(m.label)}</button>`).join("")}
+      </div>
+      ${renderTrendChart(d.trend, selected)}
     </div>
-    ${renderTrendChart(d.trend, selected)}
+    <div class="findash-kpi-col">
+      ${FINANCE_KPI_METRICS.map((m) => {
+        const value = currentValue[m.key];
+        const isNeg = (m.key === "netIncome" || m.key === "netCashFlow") && value < 0;
+        const isSel = selected.includes(m.key);
+        return `
+      <div class="findash-kpi-row ${isSel ? "selected" : ""} ${isNeg ? "negative" : ""}" style="--kpi-color:${m.color}" onclick="App.toggleFinanceMetric('${m.key}')">
+        <div class="stripe"></div>
+        <div class="body">
+          <div class="row-label">${esc(m.label)}</div>
+          <div class="row-value">${fmtMoney(value)}</div>
+          <div class="row-hint">${esc(hint[m.key])}</div>
+        </div>
+      </div>`;
+      }).join("")}
+    </div>
   </div>`;
 }
 
