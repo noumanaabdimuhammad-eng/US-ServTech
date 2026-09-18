@@ -264,6 +264,20 @@ function glAccountOptions(selected) {
     .map((b) => `<option value="CASH-${b.id}" ${("CASH-" + b.id) === selected ? "selected" : ""}>Cash — ${esc(b.name)}</option>`).join("");
   return `<option value="">— pick account —</option>${coaOpts}${bankOpts}`;
 }
+// The Expense-type accounts an expense can be coded to (Travel, Overhead,
+// Direct Cost, …) — same Chart of Accounts data as glAccountOptions, just
+// scoped to one type so the picker only shows accounts that make sense here.
+function expenseAccountOptions(selected) {
+  const opts = state.accountBalances
+    .filter((c) => c.account_type === "Expense")
+    .slice().sort((a, b) => a.code.localeCompare(b.code))
+    .map((c) => `<option value="${esc(c.code)}" ${c.code === selected ? "selected" : ""}>${esc(c.name)}</option>`).join("");
+  return `<option value="">— pick account —</option>${opts}`;
+}
+function accountName(code) {
+  const a = state.accountBalances.find((c) => c.code === code);
+  return a ? a.name : (code || "—");
+}
 function showToast(msg, isError) {
   state.toast = { msg, isError };
   render();
@@ -565,7 +579,7 @@ async function loadView(view) {
     if (view === "workorders") await Promise.all([loadWorkOrders(), state.customers.length ? null : loadCustomers()]);
     if (view === "invoices") await Promise.all([loadInvoices(), loadBankAccounts()]);
     if (view === "financeinvoices") await Promise.all([loadInvoices(), loadBankAccounts()]);
-    if (view === "expenses") await Promise.all([loadExpenses(), loadBankAccounts()]);
+    if (view === "expenses") await Promise.all([loadExpenses(), loadBankAccounts(), loadLedger()]);
     if (view === "employees") await loadEmployees();
     if (view === "payroll") await Promise.all([loadPayrollRuns(), loadEmployees(), loadBankAccounts()]);
     if (view === "assetregister") await Promise.all([loadFixedAssets(), loadBankAccounts()]);
@@ -580,7 +594,7 @@ async function loadView(view) {
     if (view === "balancesheet") await loadBalanceSheet();
     if (view === "cashflow") await loadCashFlow();
     if (view === "araging") await loadARAging();
-    if (view === "apaging") await loadAPAging();
+    if (view === "apaging") await Promise.all([loadAPAging(), loadLedger()]);
     if (view === "periodclose") await loadAccountingPeriods();
     // keep expanded rows' task lists (journal-entry lines, payroll run lines) fresh
     const openParents = Object.keys(state.expanded).filter((k) => state.expanded[k]);
@@ -962,10 +976,11 @@ App.addExpense = async function (ev) {
   ev.preventDefault();
   const v = fd(ev.target);
   if (!v.amount || Number(v.amount) <= 0) { showToast("Enter an amount", true); return false; }
+  if (!v.account_code) { showToast("Pick which account this posts to", true); return false; }
   await guard(sb.from("expenses").insert({
     expense_date: v.expense_date || new Date().toISOString().slice(0, 10),
-    category: v.category || null, vendor: v.vendor || null,
-    cost_type: v.cost_type || "Overhead", amount: Number(v.amount),
+    account_code: v.account_code, vendor: v.vendor || null,
+    amount: Number(v.amount),
     description: v.description || null, requested_by: state.session.user.id,
   }), "Expense added — pending approval");
   ev.target.reset();
@@ -989,6 +1004,13 @@ App.payExpense = async function (id, ev) {
   await guard(sb.from("expenses").update({ payment_status: "Paid", paid_from: bankId, paid_at: new Date().toISOString() }).eq("id", id), "Expense paid");
   await loadExpenses();
   render();
+};
+App.exportExpenses = function () {
+  const rows = state.expenses.map((e) => ({
+    "No.": e.expense_number, Date: e.expense_date, Account: accountName(e.account_code), Vendor: e.vendor || "—",
+    Description: e.description || "—", "Amount (SAR)": Number(e.amount || 0), Status: e.status, Payment: e.payment_status,
+  }));
+  exportRowsToExcel(`expenses-${todayStamp()}.xlsx`, [{ name: "Expenses", rows }]);
 };
 
 // --------------------------------------------------------------- employees
@@ -1429,7 +1451,7 @@ App.exportARAging = function () {
 };
 App.exportAPAging = function () {
   const rows = [
-    ...state.apExpenses.map((e) => ({ Type: "Expense", "No.": e.expense_number, "Vendor / Period": e.vendor || e.category || "—", Date: e.expense_date, "Amount (SAR)": Number(e.amount || 0) })),
+    ...state.apExpenses.map((e) => ({ Type: "Expense", "No.": e.expense_number, "Vendor / Period": e.vendor || accountName(e.account_code), Date: e.expense_date, "Amount (SAR)": Number(e.amount || 0) })),
     ...state.apPayrollRuns.map((r) => ({ Type: "Payroll", "No.": r.pr_number, "Vendor / Period": "Period " + r.period, Date: (r.approved_at || r.created_at || "").slice(0, 10), "Amount (SAR)": Number(state.apPayrollNetByRun[r.id] || 0) })),
   ].map((r) => ({ ...r, Bucket: agingBucket(r.Date) }));
   exportRowsToExcel(`ap-aging-${todayStamp()}.xlsx`, [{ name: "AP Aging", rows }]);
@@ -1548,6 +1570,8 @@ function renderShell() {
   return `
   <div class="topbar">
     <div class="brand">${LOGO_MARK}<span>US ServTech<span class="tag">Operations &amp; Finance</span></span></div>
+  </div>
+  <div class="controlbar">
     <div class="module-switch">${moduleBtns}</div>
     <div class="who"><b>${esc(state.profile.name || state.session.user.email)}</b> · ${esc(state.profile.role)}
       <button class="btn btn-ghost btn-sm" onclick="App.logout()">Sign out</button>
@@ -1974,32 +1998,43 @@ function expensePillCls(status) {
   return { Pending: "pending", Approved: "accepted", Rejected: "rejected" }[status] || "pending";
 }
 function renderExpenses() {
+  const pendingCount = state.expenses.filter((e) => e.status === "Pending").length;
+  const awaitingPayment = state.expenses.filter((e) => e.status === "Approved" && e.payment_status === "Unpaid").reduce((s, e) => s + Number(e.amount || 0), 0);
+  const thisMonth = firstOfThisMonth();
+  const paidThisMonth = state.expenses.filter((e) => e.payment_status === "Paid" && (e.paid_at || "").slice(0, 10) >= thisMonth).reduce((s, e) => s + Number(e.amount || 0), 0);
   return `
   <h2 class="page-title">Expenses</h2>
-  <p class="page-sub">Every expense needs approving, then paying — paying it is what posts it to the ledger and deducts it from the bank.</p>
+  <p class="page-sub">Every expense needs approving, then paying — paying it is what posts it to the ledger, against the account you pick below, and deducts it from the bank.</p>
+  <div class="kpi-grid">
+    <div class="kpi ${pendingCount ? "accent" : ""}"><div class="label">Pending approval</div><div class="value">${pendingCount}</div></div>
+    <div class="kpi"><div class="label">Awaiting payment</div><div class="value">${fmtMoney(awaitingPayment)}</div></div>
+    <div class="kpi"><div class="label">Paid this month</div><div class="value">${fmtMoney(paidThisMonth)}</div></div>
+  </div>
   <div class="card">
     <h3>New expense</h3>
     <form onsubmit="return App.addExpense(event)">
       <div class="form-row">
         <div class="field"><label>Date</label><input type="date" name="expense_date" value="${new Date().toISOString().slice(0, 10)}"></div>
-        <div class="field"><label>Category</label><input name="category" placeholder="Fuel, Rent, Supplies…"></div>
-        <div class="field"><label>Vendor</label><input name="vendor"></div>
-        <div class="field"><label>Type</label><select name="cost_type"><option value="Direct Cost">Direct Cost</option><option value="Overhead" selected>Overhead</option></select></div>
+        <div class="field"><label>Account *</label><select name="account_code" required>${expenseAccountOptions("5300")}</select></div>
+        <div class="field"><label>Vendor</label><input name="vendor" placeholder="Who was this paid to?"></div>
         <div class="field"><label>Amount (SAR)</label><input name="amount" type="number" step="0.01" min="0.01" required></div>
       </div>
       <div class="form-row" style="margin-top:10px">
-        <div class="field"><label>Description</label><input name="description"></div>
+        <div class="field" style="flex:2"><label>Description</label><input name="description" placeholder="What is this expense for?"></div>
         <div class="field" style="flex:0"><label>&nbsp;</label><button class="btn btn-primary" type="submit">Add</button></div>
       </div>
     </form>
   </div>
   <div class="card">
+    <div class="form-row" style="margin-bottom:12px"><div class="field" style="flex:0"><button class="btn btn-ghost btn-sm" onclick="App.exportExpenses()">Export to Excel</button></div></div>
     <table>
-      <thead><tr><th>No.</th><th>Date</th><th>Category</th><th>Vendor</th><th class="right">Amount</th><th>Status</th><th>Payment</th><th></th></tr></thead>
+      <thead><tr><th>No.</th><th>Date</th><th>Account</th><th>Vendor</th><th>Description</th><th class="right">Amount</th><th>Status</th><th>Payment</th><th></th></tr></thead>
       <tbody>
         ${state.expenses.length ? state.expenses.map((e) => `
           <tr>
-            <td>${esc(e.expense_number)}</td><td>${fmtDate(e.expense_date)}</td><td>${esc(e.category)}</td><td>${esc(e.vendor)}</td>
+            <td>${esc(e.expense_number)}</td><td>${fmtDate(e.expense_date)}</td>
+            <td>${pill(accountName(e.account_code), "closed")}</td>
+            <td>${esc(e.vendor) || "—"}</td><td>${esc(e.description) || "—"}</td>
             <td class="right">${fmtMoney(e.amount)}</td>
             <td>${pill(e.status, expensePillCls(e.status))}</td>
             <td>${e.status === "Approved" ? pill(e.payment_status, e.payment_status === "Paid" ? "paid" : "unpaid") : "—"}</td>
@@ -2013,7 +2048,7 @@ function renderExpenses() {
                   ${state.bankAccounts.map((b) => `<option value="${b.id}">${esc(b.name)}</option>`).join("")}
                 </select>` : ""}
             </td>
-          </tr>`).join("") : `<tr><td colspan="8" class="empty-state">No expenses yet.</td></tr>`}
+          </tr>`).join("") : `<tr><td colspan="9" class="empty-state">No expenses yet.</td></tr>`}
       </tbody>
     </table>
   </div>`;
@@ -2174,6 +2209,7 @@ function renderChartOfAccounts() {
     type,
     accounts: all.filter((a) => a.account_type === type && matches(a)),
   })).filter((g) => g.accounts.length || !searching);
+  const coaTypeLabel = (t) => (t === "ContraAsset" ? "Contra-Asset" : t === "ContraEquity" ? "Contra-Equity" : t);
   return `
   <h2 class="page-title">Chart of Accounts</h2>
   <p class="page-sub">Every account everything else in Finance posts against, grouped by type — click a group to collapse it. Balances are live, as of right now.${owner ? "" : " Only the Owner can add or rename accounts."}</p>
@@ -2207,7 +2243,7 @@ function renderChartOfAccounts() {
       return `
       <div class="card">
         <div class="form-row" style="cursor:pointer;margin-bottom:${collapsed ? "0" : "10px"}" onclick="App.toggleCoaGroup('${g.type}')">
-          <h4 style="margin:0">${collapsed ? "▸" : "▾"} ${esc(g.type)} <span class="subtle">(${g.accounts.length})</span></h4>
+          <h4 style="margin:0">${collapsed ? "▸" : "▾"} ${esc(coaTypeLabel(g.type))} <span class="subtle">(${g.accounts.length})</span></h4>
           <div style="margin-left:auto;font-variant-numeric:tabular-nums;font-weight:600;color:var(--ink)">${fmtMoney(subtotal)} SAR</div>
         </div>
         ${collapsed ? "" : `
@@ -2655,7 +2691,7 @@ function renderARAging() {
 
 function renderAPAging() {
   const rowsData = [
-    ...state.apExpenses.map((e) => ({ type: "Expense", number: e.expense_number, who: e.vendor || e.category || "—", date: e.expense_date, amount: Number(e.amount || 0) })),
+    ...state.apExpenses.map((e) => ({ type: "Expense", number: e.expense_number, who: e.vendor || accountName(e.account_code), date: e.expense_date, amount: Number(e.amount || 0) })),
     ...state.apPayrollRuns.map((r) => ({ type: "Payroll", number: r.pr_number, who: "Period " + r.period, date: (r.approved_at || r.created_at || "").slice(0, 10), amount: Number(state.apPayrollNetByRun[r.id] || 0) })),
   ].map((r) => ({ ...r, bucket: agingBucket(r.date) }));
   const bucketTotal = (b) => rowsData.filter((r) => r.bucket === b).reduce((s, r) => s + r.amount, 0);
