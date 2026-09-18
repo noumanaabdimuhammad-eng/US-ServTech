@@ -88,11 +88,8 @@ const MODULES = {
       { id: "incomestatement", label: "Income Statement" },
       { id: "balancesheet", label: "Balance Sheet" },
       { id: "cashflow", label: "Cash Flow" },
-      { id: "araging", label: "AR Aging" },
-      { id: "apaging", label: "AP Aging" },
       { id: "assetsliabilities", label: "Assets & Liabilities" },
       { id: "employees", label: "Employees" },
-      { id: "payroll", label: "Payroll" },
       { id: "assetregister", label: "Asset Register" },
       { id: "importdata", label: "Import Data" },
       { id: "periodclose", label: "Period Close" },
@@ -107,9 +104,10 @@ const MODULES = {
       { label: "Overview", tabs: ["financedashboard"] },
       { label: "Accounting", tabs: ["chartofaccounts", "journalentries", "generalledger", "bankaccounts"] },
       { label: "Invoices & Expenses", tabs: ["financeinvoices", "cashcollections", "expenses"] },
-      { label: "Reports", tabs: ["trialbalance", "incomestatement", "balancesheet", "cashflow", "araging", "apaging", "assetsliabilities"] },
-      { label: "Payroll & Assets", tabs: ["employees", "payroll", "assetregister"] },
-      { label: "Configuration", tabs: ["importdata", "periodclose", "team"] },
+      { label: "Reports", tabs: ["trialbalance", "incomestatement", "balancesheet", "cashflow", "assetsliabilities"] },
+      { label: "HR", tabs: ["employees", "team"] },
+      { label: "Asset Register", tabs: ["assetregister"] },
+      { label: "Configuration", tabs: ["importdata", "periodclose"] },
     ],
   },
 };
@@ -185,6 +183,7 @@ const state = {
   coaSearch: "",
   coaCollapsed: {},     // account_type -> true when that group is collapsed
   coaEditingCode: null, // code of the account currently shown as an inline edit row (null = none)
+  bankEditingId: null,  // id of the bank account currently shown as an inline edit row (null = none)
   periodDraft: { period_label: "", start_date: "", end_date: "" },
   statementDates: {
     trialbalance: { asOf: new Date().toISOString().slice(0, 10) },
@@ -361,6 +360,15 @@ function expenseAccountOptions(selected) {
 function accountName(code) {
   const a = state.accountBalances.find((c) => c.code === code);
   return a ? a.name : (code || "—");
+}
+// Bank accounts a NEW payment can be made from. A closed account is never
+// hard-deleted (its history stays fully intact in the ledger — see
+// renderBankAccounts) but it should stop being offered anywhere someone is
+// picking where to post a fresh payment, so every "pick a bank" / "pay
+// from" dropdown filters through this instead of using state.bankAccounts
+// directly.
+function activeBankAccounts() {
+  return state.bankAccounts.filter((b) => b.active !== false);
 }
 function showToast(msg, isError) {
   state.toast = { msg, isError };
@@ -1546,6 +1554,40 @@ App.addBankAccount = async function (ev) {
   render();
   return false;
 };
+App.startEditBankAccount = function (id) {
+  state.bankEditingId = id;
+  render();
+};
+App.cancelEditBankAccount = function () {
+  state.bankEditingId = null;
+  render();
+};
+App.saveBankAccount = async function (id) {
+  const nameInput = document.getElementById(`bankEditName-${id}`);
+  const typeInput = document.getElementById(`bankEditType-${id}`);
+  const numberInput = document.getElementById(`bankEditNumber-${id}`);
+  const name = ((nameInput && nameInput.value) || "").trim();
+  if (!name) { showToast("Bank account name is required", true); return; }
+  await guard(sb.from("bank_accounts").update({
+    name, account_type: (typeInput && typeInput.value.trim()) || null, account_number: (numberInput && numberInput.value.trim()) || null,
+  }).eq("id", id), "Bank account updated");
+  state.bankEditingId = null;
+  await loadBankAccounts();
+  await loadLedger();
+  render();
+};
+// Never a hard delete — bank_accounts rows are referenced historically by
+// journal_lines.account_code ('CASH-<id>'), so closing just flips this flag.
+// A closed account keeps its full balance and ledger history everywhere
+// (Chart of Accounts, General Ledger, Trial Balance, Balance Sheet, Cash
+// Flow) — it only disappears from "pick a bank to pay from" pickers, via
+// activeBankAccounts(). Reopening is just as reversible.
+App.toggleBankAccountActive = async function (id, reopening) {
+  if (!reopening && !confirm("Close this bank account? It stays fully visible in the ledger and financial statements — it just won't be offered anymore for new payments. You can reopen it any time.")) return;
+  await guard(sb.from("bank_accounts").update({ active: reopening }).eq("id", id), reopening ? "Bank account reopened" : "Bank account closed");
+  await loadBankAccounts();
+  render();
+};
 
 // ------------------------------------------------------------ chart of accounts
 //
@@ -1621,8 +1663,10 @@ App.deleteChartAccount = async function (code, name) {
   render();
 };
 App.exportChartOfAccounts = function () {
+  const rows = state.accountBalances.slice().sort((a, b) => a.code.localeCompare(b.code))
+    .concat(bankAccountsAsCoaRows().sort((a, b) => a.name.localeCompare(b.name)));
   exportRowsToExcel(`chart-of-accounts-${todayStamp()}.xlsx`, [
-    { name: "Chart of Accounts", rows: state.accountBalances.slice().sort((a, b) => a.code.localeCompare(b.code)).map((a) => ({
+    { name: "Chart of Accounts", rows: rows.map((a) => ({
       "Code": a.code, "Account": a.name, "Type": a.account_type, "Balance (SAR)": Number(a.balance || 0),
     })) },
   ]);
@@ -2153,7 +2197,6 @@ function renderView() {
     case "expenses": return canApproveOrManage() ? renderExpenses() : mgmtOnlyView();
     case "team": return isOwner() ? renderTeam() : mgmtOnlyView();
     case "employees": return isMgmt() ? renderEmployees() : mgmtOnlyView();
-    case "payroll": return isMgmt() ? renderPayroll() : mgmtOnlyView();
     case "assetregister": return isMgmt() ? renderFixedAssets() : mgmtOnlyView();
     case "assetsliabilities": return isMgmt() ? renderAssetsLiabilities() : mgmtOnlyView();
     case "financedashboard": return isMgmt() ? renderFinanceDashboard() : mgmtOnlyView();
@@ -2165,8 +2208,6 @@ function renderView() {
     case "incomestatement": return isMgmt() ? renderIncomeStatement() : mgmtOnlyView();
     case "balancesheet": return isMgmt() ? renderBalanceSheet() : mgmtOnlyView();
     case "cashflow": return isMgmt() ? renderCashFlow() : mgmtOnlyView();
-    case "araging": return isMgmt() ? renderARAging() : mgmtOnlyView();
-    case "apaging": return isMgmt() ? renderAPAging() : mgmtOnlyView();
     case "periodclose": return isMgmt() ? renderPeriodClose() : mgmtOnlyView();
     case "importdata": return isMgmt() ? renderImportData() : mgmtOnlyView();
     default: return "";
@@ -2599,7 +2640,7 @@ function renderInvoicePaidCell(inv) {
   if (canApproveOrManage()) {
     html += `<select onchange="App.markInvoicePaid('${inv.id}',event)">
       <option value="">Pick bank…</option>
-      ${state.bankAccounts.map((b) => `<option value="${b.id}">${esc(b.name)}</option>`).join("")}
+      ${activeBankAccounts().map((b) => `<option value="${b.id}">${esc(b.name)}</option>`).join("")}
     </select>`;
   }
   if (canOpsWrite()) {
@@ -2949,7 +2990,7 @@ function renderExpenses() {
               ${e.status === "Approved" && e.payment_status === "Unpaid" ? `
                 <select onchange="App.payExpense('${e.id}',event)">
                   <option value="">Pay from…</option>
-                  ${state.bankAccounts.map((b) => `<option value="${b.id}">${esc(b.name)}</option>`).join("")}
+                  ${activeBankAccounts().map((b) => `<option value="${b.id}">${esc(b.name)}</option>`).join("")}
                 </select>` : ""}
             </td>
           </tr>`).join("") : `<tr><td colspan="9" class="empty-state">No expenses yet.</td></tr>`}
@@ -3088,7 +3129,7 @@ function renderPayroll() {
               ${r.status === "Approved" ? `
                 <select onchange="App.payPayrollRun('${r.id}',event)">
                   <option value="">Pay from…</option>
-                  ${state.bankAccounts.map((b) => `<option value="${b.id}">${esc(b.name)}</option>`).join("")}
+                  ${activeBankAccounts().map((b) => `<option value="${b.id}">${esc(b.name)}</option>`).join("")}
                 </select>` : ""}
             </td>
           </tr>
@@ -3137,7 +3178,7 @@ function renderFixedAssets() {
         <div class="field"><label>Useful life (months)</label><input name="useful_life_months" type="number" step="1" min="1" value="36"></div>
         <div class="field"><label>Paid from *</label><select name="paid_from" required>
           <option value="">— pick bank —</option>
-          ${state.bankAccounts.map((b) => `<option value="${b.id}">${esc(b.name)}</option>`).join("")}
+          ${activeBankAccounts().map((b) => `<option value="${b.id}">${esc(b.name)}</option>`).join("")}
         </select></div>
         <div class="field" style="flex:0"><label>&nbsp;</label><button class="btn btn-primary" type="submit">Add</button></div>
       </div>
@@ -3165,12 +3206,37 @@ function renderFixedAssets() {
 
 // ---------------------------------------------------------- Chart of Accounts
 
+// Every bank/cash account (including the "Cash in Hand" custody account
+// employees collect into and managers/owners confirm) reformatted to look
+// like a Chart-of-Accounts row, so the Chart of Accounts screen shows the
+// complete Asset picture instead of only the named accounts in
+// chart_of_accounts. These are display-only here — bank_accounts is a
+// separate table with its own screen (Bank Accounts) for adding/editing/
+// closing — but they already flow into Trial Balance, Balance Sheet, Cash
+// Flow and General Ledger today via the synthetic 'CASH-<id>' code, so
+// listing them here (without also inserting a duplicate chart_of_accounts
+// row) is display-only and can't cause double-counting anywhere.
+function bankAccountsAsCoaRows() {
+  return state.bankBalances.map((b) => {
+    const acc = state.bankAccounts.find((x) => x.id === b.id) || {};
+    return {
+      code: "CASH-" + b.id,
+      name: b.name + (acc.is_cash_custody ? " (Cash in Hand — employee collections)" : ""),
+      account_type: "Asset",
+      balance: b.current_balance,
+      isBank: true,
+      bankId: b.id,
+      closed: acc.active === false,
+    };
+  });
+}
 function renderChartOfAccounts() {
   const owner = isOwner();
   const q = (state.coaSearch || "").trim().toLowerCase();
   const searching = !!q;
   const matches = (a) => !q || a.code.toLowerCase().includes(q) || a.name.toLowerCase().includes(q);
-  const all = state.accountBalances.slice().sort((a, b) => a.code.localeCompare(b.code));
+  const all = state.accountBalances.slice().sort((a, b) => a.code.localeCompare(b.code))
+    .concat(bankAccountsAsCoaRows().sort((a, b) => a.name.localeCompare(b.name)));
   const groups = ACCOUNT_TYPES.map((type) => ({
     type,
     accounts: all.filter((a) => a.account_type === type && matches(a)),
@@ -3218,6 +3284,18 @@ function renderChartOfAccounts() {
           <tbody>
             ${g.accounts.length ? g.accounts.map((a) => {
               const isSystem = SYSTEM_ACCOUNT_CODES.includes(a.code);
+              if (a.isBank) {
+                return `
+              <tr>
+                <td>${esc(a.code)}</td>
+                <td>${esc(a.name)} <span class="subtle">(bank account${a.closed ? " — closed" : ""})</span></td>
+                <td class="right">${fmtMoney(a.balance)}</td>
+                <td style="white-space:nowrap">
+                  <button class="link-btn" onclick="App.viewAccountLedger('${a.code}')">view ledger</button>
+                  &nbsp;·&nbsp;<button class="link-btn" onclick="App.nav('bankaccounts')">manage in Bank Accounts</button>
+                </td>
+              </tr>`;
+              }
               if (owner && state.coaEditingCode === a.code) {
                 return `
               <tr class="coa-edit-row">
@@ -3258,16 +3336,42 @@ function renderChartOfAccounts() {
 function renderBankAccounts() {
   return `
   <h2 class="page-title">Bank Accounts</h2>
-  <p class="page-sub">Cash balances update live as invoices are paid, and as expenses, payroll and asset purchases are paid out.</p>
+  <p class="page-sub">Cash balances update live as invoices are paid, and as expenses, payroll and asset purchases are paid out. An account can be renamed or retyped any time; closing one keeps its full history in the ledger and Chart of Accounts — it just stops being offered as a place to pay from, so you can open a new one to replace it without losing anything.</p>
   <div class="card">
     <table>
-      <thead><tr><th>Account</th><th>Type</th><th>Number</th><th class="right">Current balance (SAR)</th><th></th></tr></thead>
+      <thead><tr><th>Account</th><th>Type</th><th>Number</th><th>Status</th><th class="right">Current balance (SAR)</th><th></th></tr></thead>
       <tbody>
         ${state.bankBalances.length ? state.bankBalances.map((b) => {
           const acc = state.bankAccounts.find((x) => x.id === b.id) || {};
-          return `<tr><td>${esc(b.name)}</td><td>${esc(acc.account_type)}</td><td>${esc(acc.account_number)}</td><td class="right">${fmtMoney(b.current_balance)}</td>
-            <td><button class="link-btn" onclick="App.viewAccountLedger('CASH-${b.id}')">view ledger</button></td></tr>`;
-        }).join("") : `<tr><td colspan="5" class="empty-state">No bank accounts yet.</td></tr>`}
+          const closed = acc.active === false;
+          if (state.bankEditingId === b.id) {
+            return `
+            <tr class="coa-edit-row">
+              <td><input id="bankEditName-${b.id}" value="${esc(acc.name)}" style="width:100%"></td>
+              <td><input id="bankEditType-${b.id}" value="${esc(acc.account_type || "")}" placeholder="Current / Savings" style="width:100%"></td>
+              <td><input id="bankEditNumber-${b.id}" value="${esc(acc.account_number || "")}" style="width:100%"></td>
+              <td colspan="2">&nbsp;</td>
+              <td style="white-space:nowrap">
+                <button class="link-btn" onclick="App.saveBankAccount('${b.id}')">save</button>
+                &nbsp;·&nbsp;
+                <button class="link-btn" onclick="App.cancelEditBankAccount()">cancel</button>
+              </td>
+            </tr>`;
+          }
+          return `
+          <tr>
+            <td>${esc(b.name)}${acc.is_cash_custody ? ` <span class="subtle">(cash custody)</span>` : ""}</td>
+            <td>${esc(acc.account_type) || "—"}</td>
+            <td>${esc(acc.account_number) || "—"}</td>
+            <td>${closed ? pill("Closed", "cancelled") : pill("Open", "delivered")}</td>
+            <td class="right">${fmtMoney(b.current_balance)}</td>
+            <td style="white-space:nowrap">
+              <button class="link-btn" onclick="App.viewAccountLedger('CASH-${b.id}')">view ledger</button>
+              &nbsp;·&nbsp;<button class="link-btn" onclick="App.startEditBankAccount('${b.id}')">edit</button>
+              &nbsp;·&nbsp;<button class="link-btn ${closed ? "" : "danger"}" onclick="App.toggleBankAccountActive('${b.id}',${closed})">${closed ? "reopen" : "close"}</button>
+            </td>
+          </tr>`;
+        }).join("") : `<tr><td colspan="6" class="empty-state">No bank accounts yet.</td></tr>`}
       </tbody>
     </table>
     <form class="form-row" style="margin-top:14px" onsubmit="return App.addBankAccount(event)">
