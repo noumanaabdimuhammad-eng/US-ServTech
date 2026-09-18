@@ -51,8 +51,8 @@ const MGMT_ROLES = ["Owner", "Manager"];
 const OPS_WRITE_ROLES = ["Owner", "Manager", "Operations Staff"];
 const OPS_VIEW_ROLES = ["Owner", "Manager", "Operations Staff", "Viewer"];
 const FINANCE_VIEW_ROLES = ["Owner", "Manager", "Approver"];
-// The only two Finance tabs an Approver can reach — see MODULES.finance.groups' "Invoices & Expenses".
-const APPROVER_FINANCE_TABS = ["financeinvoices", "expenses"];
+// The only Finance tabs an Approver can reach — see MODULES.finance.groups' "Invoices & Expenses".
+const APPROVER_FINANCE_TABS = ["financeinvoices", "cashcollections", "expenses"];
 // Every role the Team screen's role picker offers, and every role the
 // manage-employee Edge Function accepts on account creation.
 const ALL_ROLES = ["Owner", "Manager", "Operations Staff", "Approver", "Viewer"];
@@ -82,6 +82,7 @@ const MODULES = {
       { id: "generalledger", label: "General Ledger" },
       { id: "bankaccounts", label: "Bank Accounts" },
       { id: "financeinvoices", label: "Invoices" },
+      { id: "cashcollections", label: "Cash Collections" },
       { id: "expenses", label: "Expenses" },
       { id: "trialbalance", label: "Trial Balance" },
       { id: "incomestatement", label: "Income Statement" },
@@ -104,7 +105,7 @@ const MODULES = {
     groups: [
       { label: "Overview", tabs: ["financedashboard"] },
       { label: "Accounting", tabs: ["chartofaccounts", "journalentries", "generalledger", "bankaccounts"] },
-      { label: "Invoices & Expenses", tabs: ["financeinvoices", "expenses"] },
+      { label: "Invoices & Expenses", tabs: ["financeinvoices", "cashcollections", "expenses"] },
       { label: "Reports", tabs: ["trialbalance", "incomestatement", "balancesheet", "cashflow", "araging", "apaging", "assetsliabilities"] },
       { label: "Payroll & Assets", tabs: ["employees", "payroll", "assetregister"] },
       { label: "Configuration", tabs: ["periodclose", "team"] },
@@ -151,6 +152,8 @@ const state = {
   workOrders: [],
   invoices: [],
   bankAccounts: [],
+  cashCollections: [],
+  selectedCash: {},   // cash_collections.id -> true, for the Cash Collections confirm-screen checkboxes
   expenses: [],
   employees: [],
   team: [],           // profiles list for the Team (employee logins) screen — Owner only
@@ -402,6 +405,17 @@ async function loadCustomers() {
 async function loadBankAccounts() {
   const { data, error } = await sb.from("bank_accounts").select("*").order("created_at");
   if (!error) state.bankAccounts = data || [];
+}
+// Cash custody trail: who's holding cash collected from customers, pending
+// the Owner/Manager/Approver confirming they've physically received it (see
+// App.logCashCollection / App.confirmSelectedCash). RLS already scopes what
+// comes back — Operations Staff only ever see their own rows here.
+async function loadCashCollections() {
+  const { data, error } = await sb.from("cash_collections")
+    .select("*, invoice:invoices(invoice_number,customer), collector:profiles!cash_collections_collected_by_fkey(name), confirmer:profiles!cash_collections_confirmed_by_fkey(name)")
+    .order("collected_at", { ascending: false })
+    .limit(500);
+  if (!error) state.cashCollections = data || [];
 }
 async function loadInquiries() {
   const { data, error } = await sb.from("inquiries").select("*").order("created_at", { ascending: false }).limit(200);
@@ -717,8 +731,9 @@ async function loadView(view) {
     if (view === "inquiries") await Promise.all([loadInquiries(), state.customers.length ? null : loadCustomers()]);
     if (view === "quotations") await Promise.all([loadQuotations(), state.customers.length ? null : loadCustomers()]);
     if (view === "workorders") await Promise.all([loadWorkOrders(), state.customers.length ? null : loadCustomers()]);
-    if (view === "invoices") await Promise.all([loadInvoices(), loadBankAccounts()]);
-    if (view === "financeinvoices") await Promise.all([loadInvoices(), loadBankAccounts()]);
+    if (view === "invoices") await Promise.all([loadInvoices(), loadBankAccounts(), loadCashCollections()]);
+    if (view === "financeinvoices") await Promise.all([loadInvoices(), loadBankAccounts(), loadCashCollections()]);
+    if (view === "cashcollections") await Promise.all([loadInvoices(), loadBankAccounts(), loadLedger(), loadCashCollections()]);
     if (view === "expenses") await Promise.all([loadExpenses(), loadBankAccounts(), loadLedger()]);
     if (view === "employees") await loadEmployees();
     if (view === "payroll") await Promise.all([loadPayrollRuns(), loadEmployees(), loadBankAccounts()]);
@@ -758,15 +773,28 @@ function scheduleRefresh() {
   clearTimeout(refreshTimer);
   refreshTimer = setTimeout(() => { loadView(state.view); }, 400);
 }
+// Guarded so a stray double-call (e.g. afterLogin() ever running twice —
+// see the afterLoginDone guard below) can't try to register postgres_changes
+// callbacks on an already-subscribed channel, which supabase-js rejects
+// outright ("cannot add postgres_changes callbacks... after subscribe()").
+let realtimeChannel = null;
 function setupRealtime() {
+  if (realtimeChannel) return;
   const tables = ["customers", "inquiries", "quotations", "work_orders", "tasks", "invoices", "bank_accounts",
     "journal_entries", "journal_lines", "chart_of_accounts", "accounting_periods",
-    "expenses", "employees", "payroll_runs", "payroll_lines", "fixed_assets"];
+    "expenses", "employees", "payroll_runs", "payroll_lines", "fixed_assets", "cash_collections"];
   const channel = sb.channel("us-servtech-live");
   tables.forEach((t) => {
     channel.on("postgres_changes", { event: "*", schema: "public", table: t }, scheduleRefresh);
   });
   channel.subscribe();
+  realtimeChannel = channel;
+}
+function teardownRealtime() {
+  if (realtimeChannel) {
+    sb.removeChannel(realtimeChannel);
+    realtimeChannel = null;
+  }
 }
 
 // ------------------------------------------------------------------ auth
@@ -795,10 +823,22 @@ async function init() {
         render();
       }, 0);
     }
-    if (!session) { state.profile = null; render(); }
+    if (!session) { state.profile = null; teardownRealtime(); render(); }
   });
 }
-async function afterLogin() {
+// App.login sets state.session and calls afterLogin() directly (see below),
+// and onAuthStateChange's own SIGNED_IN handling can also reach it — both
+// exist so a sign-in never depends on just one signal (that's the login-hang
+// fix). Exactly when each fires relative to the other isn't guaranteed, so
+// this dedupes concurrent/duplicate calls onto a single in-flight run —
+// without it, both paths racing could call setupRealtime() twice on the same
+// realtime channel topic, which supabase-js rejects the second time.
+let afterLoginPromise = null;
+function afterLogin() {
+  if (!afterLoginPromise) afterLoginPromise = afterLoginImpl().finally(() => { afterLoginPromise = null; });
+  return afterLoginPromise;
+}
+async function afterLoginImpl() {
   const { data: profile } = await sb.from("profiles").select("*").eq("id", state.session.user.id).maybeSingle();
   state.profile = profile;
   if (profile && profile.active) {
@@ -846,6 +886,7 @@ App.login = async function (ev) {
 };
 App.logout = async function () {
   await sb.auth.signOut();
+  teardownRealtime();
   state.view = "dashboard";
   render();
 };
@@ -1155,6 +1196,48 @@ App.markInvoicePaid = async function (id, ev) {
     payment_status: "Paid", paid_from: bankId, paid_at: new Date().toISOString(), marked_paid_by: state.session.user.id,
   }).eq("id", id), "Invoice marked paid");
   await loadInvoices();
+  render();
+};
+
+// ----------------------------------------------------- cash collections
+// Most sales are cash: an employee collects it from the customer and logs
+// that here (still Unpaid — this is only the employee's claim). Owner/
+// Manager/Approver later confirm the weekly handover on the Cash
+// Collections screen, which is what actually marks the invoice Paid and
+// moves the cash into Cash in Hand (see confirm_cash_collections()).
+App.logCashCollection = async function (invoiceId) {
+  const { data: amount, error: terr } = await sb.rpc("invoice_total", { p_invoice_id: invoiceId });
+  if (terr) { showToast(terr.message, true); return; }
+  await guard(sb.from("cash_collections").insert({
+    invoice_id: invoiceId, collected_by: state.session.user.id, amount: amount,
+  }), "Logged as cash collected — pending confirmation");
+  await loadCashCollections();
+  render();
+};
+App.voidCashCollection = async function (id) {
+  if (!confirm("Undo this cash collection entry?")) return;
+  await guard(sb.rpc("void_cash_collection", { p_id: id }), "Cash collection entry undone");
+  await Promise.all([loadCashCollections(), loadInvoices()]);
+  render();
+};
+App.toggleCashSelect = function (id) {
+  state.selectedCash[id] = !state.selectedCash[id];
+  render();
+};
+App.toggleCashSelectAllFor = function (employeeId) {
+  const ids = state.cashCollections.filter((c) => c.status === "pending" && c.collected_by === employeeId).map((c) => c.id);
+  const allSelected = ids.length > 0 && ids.every((id) => state.selectedCash[id]);
+  ids.forEach((id) => { state.selectedCash[id] = !allSelected; });
+  render();
+};
+App.confirmSelectedCash = async function () {
+  const ids = Object.keys(state.selectedCash).filter((k) => state.selectedCash[k]);
+  if (!ids.length) { showToast("Select at least one collection to confirm", true); return; }
+  const result = await guard(sb.rpc("confirm_cash_collections", { p_ids: ids }));
+  const row = Array.isArray(result) ? result[0] : result;
+  showToast(`Confirmed ${row.confirmed_count} invoice(s) — SAR ${fmtMoney(row.total_amount)} moved to Cash in Hand`);
+  state.selectedCash = {};
+  await Promise.all([loadInvoices(), loadCashCollections(), loadBankAccounts()]);
   render();
 };
 
@@ -1931,6 +2014,7 @@ function renderView() {
     case "workorders": return renderWorkOrders();
     case "invoices": return renderInvoices();
     case "financeinvoices": return canApproveOrManage() ? renderInvoices() : mgmtOnlyView();
+    case "cashcollections": return canApproveOrManage() ? renderCashCollections() : mgmtOnlyView();
     case "expenses": return canApproveOrManage() ? renderExpenses() : mgmtOnlyView();
     case "team": return isOwner() ? renderTeam() : mgmtOnlyView();
     case "employees": return isMgmt() ? renderEmployees() : mgmtOnlyView();
@@ -2310,13 +2394,70 @@ function renderWorkOrders() {
 
 // ---------------------------------------------------------- Invoices
 
+// The employee's own "cash with me" card, shown at the top of the
+// Operations Invoices screen — their running custody balance of cash
+// they've collected but that hasn't been confirmed/handed over yet.
+function renderMyCashSummary() {
+  if (!canOpsWrite()) return "";
+  const mine = (state.cashCollections || []).filter((c) => c.status === "pending" && c.collected_by === state.session.user.id);
+  if (!mine.length) return "";
+  const total = mine.reduce((s, c) => s + Number(c.amount || 0), 0);
+  return `
+  <div class="card" style="margin-bottom:18px">
+    <h3 style="margin-top:0">Cash with you: SAR ${fmtMoney(total)}</h3>
+    <p class="subtle">${mine.length} invoice(s) you've logged as collected in cash, awaiting confirmation from Owner/Manager.</p>
+    <table>
+      <thead><tr><th>Invoice</th><th>Customer</th><th>Collected</th><th class="right">Amount (SAR)</th><th></th></tr></thead>
+      <tbody>
+        ${mine.map((c) => `
+        <tr>
+          <td>${esc(c.invoice ? c.invoice.invoice_number : "—")}</td>
+          <td>${esc(c.invoice ? c.invoice.customer : "—")}</td>
+          <td>${fmtDateTime(c.collected_at)}</td>
+          <td class="right">${fmtMoney(c.amount)}</td>
+          <td><button class="link-btn" onclick="App.voidCashCollection('${c.id}')">undo</button></td>
+        </tr>`).join("")}
+      </tbody>
+    </table>
+  </div>`;
+}
+// What goes in the invoice row's payment-action cell: a paid invoice shows
+// which bank it landed in; an Unpaid one with a pending cash collection
+// shows who's holding the cash (and lets them/Owner/Manager undo it); a
+// plain Unpaid one offers the direct "Mark paid" bank picker (for bank
+// transfers, or cash Owner/Manager collected themselves) and/or the
+// "I collected cash" button (for the employee-custody flow).
+function renderInvoicePaidCell(inv) {
+  if (inv.payment_status !== "Unpaid") {
+    return inv.paid_from ? esc((state.bankAccounts.find((b) => b.id === inv.paid_from) || {}).name || "") : "";
+  }
+  const pending = (state.cashCollections || []).find((c) => c.invoice_id === inv.id && c.status === "pending");
+  if (pending) {
+    const mine = pending.collected_by === state.session.user.id;
+    return `<div class="subtle">Cash collected by ${esc(pending.collector ? pending.collector.name : "—")}<br>pending confirmation</div>
+      ${(mine || isMgmt()) ? `<button class="link-btn" onclick="App.voidCashCollection('${pending.id}')">undo</button>` : ""}`;
+  }
+  let html = "";
+  if (canApproveOrManage()) {
+    html += `<select onchange="App.markInvoicePaid('${inv.id}',event)">
+      <option value="">Pick bank…</option>
+      ${state.bankAccounts.map((b) => `<option value="${b.id}">${esc(b.name)}</option>`).join("")}
+    </select>`;
+  }
+  if (canOpsWrite()) {
+    html += `<div${canApproveOrManage() ? ' style="margin-top:6px"' : ""}><button class="btn btn-ghost btn-sm" onclick="App.logCashCollection('${inv.id}')">I collected cash</button></div>`;
+  }
+  return html;
+}
 function renderInvoices() {
+  const showActionCol = canApproveOrManage() || canOpsWrite();
   return `
   <h2 class="page-title">Invoices</h2>
-  <p class="page-sub">Invoices appear here automatically once a work order is fully delivered.</p>
+  <p class="page-sub">Invoices appear here automatically once a work order is fully delivered. Most sales are cash — log what you collect below; it's marked Paid once Owner/Manager confirms the handover on Finance → Cash Collections.</p>
+  ${renderMyCashSummary()}
   <div class="card">
     <table>
-      <thead><tr><th>No.</th><th>Work order</th><th>Customer</th><th>Date</th><th class="right">Total (SAR)</th><th>Status</th>${canApproveOrManage() ? "<th>Mark paid</th>" : ""}</tr></thead>
+      <thead><tr><th>No.</th><th>Work order</th><th>Customer</th><th>Date</th><th class="right">Total (SAR)</th><th>Status</th>${showActionCol ? "<th>Payment</th>" : ""}</tr></thead>
       <tbody>
         ${state.invoices.length ? state.invoices.map((inv) => {
           const wo = state.workOrders.find((w) => w.id === inv.wo_id);
@@ -2328,16 +2469,88 @@ function renderInvoices() {
             <td>${fmtDate(inv.invoice_date)}</td>
             <td class="right">${total !== null ? fmtMoney(total) : `<button class="link-btn" onclick="App.toggle('workorders','${wo ? wo.id : ""}');App.nav('workorders')">view on work order</button>`}</td>
             <td>${pill(inv.payment_status, inv.payment_status === "Paid" ? "paid" : "unpaid")}${inv.paid_at ? `<div class="subtle">${fmtDateTime(inv.paid_at)}</div>` : ""}</td>
-            ${canApproveOrManage() ? `<td>${inv.payment_status === "Unpaid" ? `
-              <select onchange="App.markInvoicePaid('${inv.id}',event)">
-                <option value="">Pick bank…</option>
-                ${state.bankAccounts.map((b) => `<option value="${b.id}">${esc(b.name)}</option>`).join("")}
-              </select>` : (inv.paid_from ? esc((state.bankAccounts.find((b) => b.id === inv.paid_from) || {}).name || "") : "")}</td>` : ""}
+            ${showActionCol ? `<td>${renderInvoicePaidCell(inv)}</td>` : ""}
           </tr>`;
-        }).join("") : `<tr><td colspan="${canApproveOrManage() ? 7 : 6}" class="empty-state">No invoices yet.</td></tr>`}
+        }).join("") : `<tr><td colspan="${showActionCol ? 7 : 6}" class="empty-state">No invoices yet.</td></tr>`}
       </tbody>
     </table>
   </div>`;
+}
+
+// ---------------------------------------------------- Cash Collections
+
+function renderCashCollections() {
+  const pending = (state.cashCollections || []).filter((c) => c.status === "pending");
+  const confirmed = (state.cashCollections || []).filter((c) => c.status === "confirmed").slice(0, 15);
+  const cashAccount = (state.bankAccounts || []).find((b) => b.is_cash_custody);
+  const cashBal = cashAccount ? (state.bankBalances || []).find((b) => b.id === cashAccount.id) : null;
+  const totalPending = pending.reduce((s, c) => s + Number(c.amount || 0), 0);
+
+  const byEmployee = {};
+  pending.forEach((c) => {
+    const key = c.collected_by;
+    if (!byEmployee[key]) byEmployee[key] = { name: c.collector ? c.collector.name : "—", rows: [] };
+    byEmployee[key].rows.push(c);
+  });
+
+  const selectedIds = Object.keys(state.selectedCash || {}).filter((k) => state.selectedCash[k]);
+  const selectedTotal = pending.filter((c) => selectedIds.includes(c.id)).reduce((s, c) => s + Number(c.amount || 0), 0);
+
+  return `
+  <h2 class="page-title">Cash Collections</h2>
+  <p class="page-sub">Employees log cash they've collected from customers on the Invoices screen. Confirming a handover here is what actually marks those invoices Paid and moves the cash from that employee into Cash in Hand.</p>
+  <div class="kpi-grid">
+    <div class="kpi ${pending.length ? "accent" : ""}"><div class="label">Pending with employees</div><div class="value">${fmtMoney(totalPending)}</div></div>
+    <div class="kpi"><div class="label">Cash in hand</div><div class="value">${cashBal ? fmtMoney(cashBal.current_balance) : "—"}</div><div class="hint">Confirmed cash currently with Owner/Manager</div></div>
+    <div class="kpi"><div class="label">Selected to confirm</div><div class="value">${fmtMoney(selectedTotal)}</div></div>
+  </div>
+  ${Object.keys(byEmployee).length ? Object.entries(byEmployee).map(([empId, grp]) => {
+    const allSelected = grp.rows.length > 0 && grp.rows.every((c) => state.selectedCash && state.selectedCash[c.id]);
+    const empTotal = grp.rows.reduce((s, c) => s + Number(c.amount || 0), 0);
+    return `
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;margin-bottom:10px">
+        <h3 style="margin:0">${esc(grp.name)} — SAR ${fmtMoney(empTotal)} pending</h3>
+        <label style="font-size:12px;color:var(--muted);display:flex;align-items:center;gap:6px;cursor:pointer">
+          <input type="checkbox" ${allSelected ? "checked" : ""} onchange="App.toggleCashSelectAllFor('${empId}')"> select all
+        </label>
+      </div>
+      <table>
+        <thead><tr><th></th><th>Invoice</th><th>Customer</th><th>Collected</th><th class="right">Amount (SAR)</th></tr></thead>
+        <tbody>
+          ${grp.rows.map((c) => `
+          <tr>
+            <td><input type="checkbox" ${state.selectedCash && state.selectedCash[c.id] ? "checked" : ""} onchange="App.toggleCashSelect('${c.id}')"></td>
+            <td>${esc(c.invoice ? c.invoice.invoice_number : "—")}</td>
+            <td>${esc(c.invoice ? c.invoice.customer : "—")}</td>
+            <td>${fmtDateTime(c.collected_at)}</td>
+            <td class="right">${fmtMoney(c.amount)}</td>
+          </tr>`).join("")}
+        </tbody>
+      </table>
+    </div>`;
+  }).join("") : `<div class="card empty-state">No pending cash collections.</div>`}
+  <div class="card">
+    <button class="btn btn-primary" ${selectedIds.length ? "" : "disabled"} onclick="App.confirmSelectedCash()">Confirm &amp; mark paid (${selectedIds.length})</button>
+  </div>
+  ${confirmed.length ? `
+  <div class="card">
+    <h3 style="margin-top:0">Recently confirmed</h3>
+    <table>
+      <thead><tr><th>Invoice</th><th>Customer</th><th>Employee</th><th>Confirmed by</th><th>Confirmed</th><th class="right">Amount (SAR)</th></tr></thead>
+      <tbody>
+        ${confirmed.map((c) => `
+        <tr>
+          <td>${esc(c.invoice ? c.invoice.invoice_number : "—")}</td>
+          <td>${esc(c.invoice ? c.invoice.customer : "—")}</td>
+          <td>${esc(c.collector ? c.collector.name : "—")}</td>
+          <td>${esc(c.confirmer ? c.confirmer.name : "—")}</td>
+          <td>${fmtDateTime(c.confirmed_at)}</td>
+          <td class="right">${fmtMoney(c.amount)}</td>
+        </tr>`).join("")}
+      </tbody>
+    </table>
+  </div>` : ""}`;
 }
 
 // ---------------------------------------------------------- Expenses
