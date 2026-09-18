@@ -213,7 +213,12 @@ const state = {
   authError: "",
   toast: null,
   sidebarOpen: false, // off-canvas sidebar state on narrow screens — ignored by the CSS above the mobile breakpoint
+  sidebarCollapsed: false, // desktop icon-only sidebar toggle — persisted below via localStorage
 };
+// Remembers the collapsed/expanded sidebar choice across visits. Wrapped in
+// try/catch since localStorage can throw (private browsing, blocked storage)
+// — falling back to the default (expanded) is fine either way.
+try { state.sidebarCollapsed = localStorage.getItem("usst_sidebar_collapsed") === "1"; } catch (e) {}
 
 // ---------------------------------------------------------------- helpers
 
@@ -924,6 +929,14 @@ App.nav = function (view) {
 };
 App.toggleSidebar = function (v) {
   state.sidebarOpen = typeof v === "boolean" ? v : !state.sidebarOpen;
+  render();
+};
+// Desktop-only icon-only sidebar collapse (the off-canvas mobile panel above
+// always shows in full, regardless of this — see the max-width:860px
+// override in index.html).
+App.toggleSidebarCollapse = function () {
+  state.sidebarCollapsed = !state.sidebarCollapsed;
+  try { localStorage.setItem("usst_sidebar_collapsed", state.sidebarCollapsed ? "1" : "0"); } catch (e) {}
   render();
 };
 // Switching module jumps to that module's first tab. Finance is refused for
@@ -1979,21 +1992,43 @@ function render() {
 // See .logo-badge in index.html for sizing.
 const LOGO_MARK = `<img class="logo-badge" src="data:image/png;base64,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" alt="US ServTech">`;
 
+// Small inline eye / eye-off glyphs for the login password field's show/hide
+// toggle — see App.toggleLoginPasswordVisibility, which swaps this markup
+// directly in the DOM (no render() call) so the fields the person has
+// already typed into never get touched.
+const EYE_ICON = `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8Z"/><circle cx="12" cy="12" r="3"/></svg>`;
+const EYE_OFF_ICON = `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.94 17.94A10.94 10.94 0 0 1 12 20c-7 0-11-8-11-8a21.8 21.8 0 0 1 5.06-6.06M9.9 4.24A10.94 10.94 0 0 1 12 4c7 0 11 8 11 8a21.7 21.7 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>`;
 function renderLogin() {
   return `
   <div class="login-wrap">
     <div class="login-card">
-      <div class="login-brand">${LOGO_MARK}<h1>US ServTech</h1></div>
-      <p class="sub">Operations &amp; Finance — sign in with your company login.</p>
+      ${LOGO_MARK}
+      <h1 class="welcome">Welcome Back</h1>
+      <p class="sub">Sign in to continue to your account</p>
       <form onsubmit="return App.login(event)">
-        <div class="field"><label>Email</label><input type="email" name="email" required autocomplete="username"></div>
-        <div class="field"><label>Password</label><input type="password" name="password" required autocomplete="current-password"></div>
-        <button class="btn btn-primary" type="submit" style="width:100%" ${state.authBusy ? "disabled" : ""}>${state.authBusy ? "Signing in…" : "Sign in"}</button>
+        <div class="field"><label>Email Address</label><input type="email" name="email" required autocomplete="username"></div>
+        <div class="field"><label>Password</label>
+          <div class="pw-field-wrap">
+            <input type="password" name="password" id="loginPasswordInput" required autocomplete="current-password">
+            <button type="button" id="loginPwToggleBtn" class="pw-toggle" onclick="App.toggleLoginPasswordVisibility()" aria-label="Show password">${EYE_ICON}</button>
+          </div>
+        </div>
+        <div class="login-remember"><input type="checkbox" id="loginRemember"><label for="loginRemember">Remember Me</label></div>
+        <button class="btn btn-primary" type="submit" style="width:100%" ${state.authBusy ? "disabled" : ""}>${state.authBusy ? "Signing in…" : "Sign In"}</button>
         <div class="error-msg">${esc(state.authError)}</div>
       </form>
     </div>
   </div>`;
 }
+App.toggleLoginPasswordVisibility = function () {
+  const inp = document.getElementById("loginPasswordInput");
+  const btn = document.getElementById("loginPwToggleBtn");
+  if (!inp || !btn) return;
+  const showing = inp.type === "text";
+  inp.type = showing ? "password" : "text";
+  btn.innerHTML = showing ? EYE_ICON : EYE_OFF_ICON;
+  btn.setAttribute("aria-label", showing ? "Show password" : "Hide password");
+};
 function renderDisabled() {
   return `
   <div class="login-wrap">
@@ -2017,17 +2052,17 @@ function renderShell() {
   const showOperations = canViewOperations();
   const showFinance = canViewFinance();
   const moduleBtns = `
-    ${showOperations ? `<button class="mod-operations ${mod === "operations" ? "active" : ""}" onclick="App.switchModule('operations')"><span class="mod-dot"></span>Operations</button>` : ""}
-    ${showFinance ? `<button class="mod-finance ${mod === "finance" ? "active" : ""}" onclick="App.switchModule('finance')"><span class="mod-dot"></span>Finance</button>` : ""}`;
+    ${showOperations ? `<button class="mod-operations ${mod === "operations" ? "active" : ""}" onclick="App.switchModule('operations')" title="Operations"><span class="mod-icon">O</span><span class="sidebar-label">Operations</span></button>` : ""}
+    ${showFinance ? `<button class="mod-finance ${mod === "finance" ? "active" : ""}" onclick="App.switchModule('finance')" title="Finance"><span class="mod-icon">F</span><span class="sidebar-label">Finance</span></button>` : ""}`;
   const modDef = MODULES[mod] || MODULES.operations;
-  // Modules with a `groups` array (currently just Finance) get their nav
-  // rendered as labeled sections (a bit like the "INSPECTION / ASSESSMENT
-  // REPORT" clusters in a typical ops-console sidebar) instead of one flat
-  // list — so a long list of screens reads as organized areas. Finance also
-  // filters everything down to whatever this role may actually reach
+  // The sidebar now holds only identity + the Operations/Finance module
+  // switch — every screen *within* the active module lives in this
+  // horizontal top subnav instead (subnavHtml below), grouped into labeled
+  // clusters for Finance the same way the old in-sidebar nav grouped them,
+  // filtered down to whatever this role may actually reach
   // (financeVisibleTabIds()) — e.g. an Approver only ever sees the
   // "Invoices & Expenses" group, and only Owner sees "Team".
-  let navHtml;
+  let subnavHtml;
   if (modDef.groups) {
     const visibleIds = mod === "finance" ? financeVisibleTabIds() : modDef.tabs.map((t) => t.id);
     const tabById = {};
@@ -2035,28 +2070,30 @@ function renderShell() {
     const visibleGroups = modDef.groups
       .map((g) => ({ ...g, tabs: g.tabs.filter((id) => visibleIds.includes(id)) }))
       .filter((g) => g.tabs.length);
-    navHtml = visibleGroups.map((g) => `
-      <div class="nav-group-label">${esc(g.label)}</div>
-      ${g.tabs.map((id) => `<button class="nav-item ${state.view === id ? "active" : ""}" onclick="App.nav('${id}')">${esc(tabById[id].label)}</button>`).join("")}
-    `).join("");
+    subnavHtml = visibleGroups.map((g) => `
+      <div class="subnav-group">
+        <span class="subnav-group-label">${esc(g.label)}</span>
+        ${g.tabs.map((id) => `<button class="subnav-item ${state.view === id ? "active" : ""}" onclick="App.nav('${id}')">${esc(tabById[id].label)}</button>`).join("")}
+      </div>`).join("");
   } else {
-    navHtml = modDef.tabs.map((t) =>
-      `<button class="nav-item ${state.view === t.id ? "active" : ""}" onclick="App.nav('${t.id}')">${esc(t.label)}</button>`
+    subnavHtml = modDef.tabs.map((t) =>
+      `<button class="subnav-item ${state.view === t.id ? "active" : ""}" onclick="App.nav('${t.id}')">${esc(t.label)}</button>`
     ).join("");
   }
   const displayName = state.profile.name || state.session.user.email;
   const crumb = (MODULES[mod] && MODULES[mod].tabs.find((t) => t.id === state.view)) || { label: "" };
   return `
-  <div class="shell ${state.sidebarOpen ? "sidebar-open" : ""}">
+  <div class="shell ${state.sidebarOpen ? "sidebar-open" : ""} ${state.sidebarCollapsed ? "sidebar-collapsed" : ""}">
     <aside class="sidebar">
-      <div class="sidebar-brand">${LOGO_MARK}<div><div class="sidebar-title">US ServTech</div><div class="sidebar-tag">Operations &amp; Finance</div></div></div>
+      <button class="sidebar-collapse-toggle" onclick="App.toggleSidebarCollapse()" title="${state.sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}" aria-label="${state.sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}">${state.sidebarCollapsed ? "›" : "‹"}</button>
+      <div class="sidebar-brand">${LOGO_MARK}<div class="brand-text"><div class="sidebar-title">US ServTech</div><div class="sidebar-tag">Operations &amp; Finance</div></div></div>
       <div class="sidebar-profile">
         <div class="avatar">${esc(initialsFor(displayName))}</div>
         <div class="who-text"><div class="who-name">${esc(displayName)}</div><div class="who-role"><span class="status-dot"></span>${esc(state.profile.role)}</div></div>
       </div>
       <div class="sidebar-modules">${moduleBtns}</div>
-      <nav class="sidebar-nav">${navHtml}</nav>
-      <button class="sidebar-signout" onclick="App.logout()">Sign out</button>
+      <div style="flex:1"></div>
+      <button class="sidebar-signout" onclick="App.logout()" title="Sign out"><span class="signout-icon">⏻</span><span class="sidebar-label">Sign out</span></button>
     </aside>
     <div class="sidebar-backdrop" onclick="App.toggleSidebar(false)"></div>
     <div class="main-col">
@@ -2065,6 +2102,7 @@ function renderShell() {
         <div class="topbar-crumb">${esc(MODULES[mod] ? MODULES[mod].label : "")}${crumb.label ? " · " + esc(crumb.label) : ""}</div>
         <div class="avatar avatar-sm">${esc(initialsFor(displayName))}</div>
       </div>
+      <div class="topbar"><div class="topbar-inner"><div class="subnav-scroll"><nav class="subnav">${subnavHtml}</nav></div></div></div>
       <main>${state.loading ? `<div class="empty-state">Loading…</div>` : renderView()}</main>
     </div>
   </div>
@@ -2367,7 +2405,7 @@ function renderInquiries() {
       ${pickedCustomer ? renderCustomerInfoPanel(pickedCustomer) : renderNewCustomerFields(d)}
 
       <h4 style="margin-top:16px;margin-bottom:8px">Services required</h4>
-      <table>
+      <table class="items-table">
         <thead><tr><th>Service</th><th>Description</th><th class="right">Price (SAR)</th><th class="right">Discount (SAR)</th><th></th></tr></thead>
         <tbody>
           ${d.items.map((it, idx) => `
@@ -2379,9 +2417,9 @@ function renderInquiries() {
               </select>
             </td>
             <td><input value="${esc(it.description)}" oninput="App.setDraftItemField(${idx},'description',this.value)" placeholder="e.g. Torque wrench 0–200 Nm"></td>
-            <td class="right"><input type="number" step="0.01" min="0" style="width:110px" value="${esc(it.price)}" oninput="App.setDraftItemField(${idx},'price',this.value)"></td>
-            <td class="right"><input type="number" step="0.01" min="0" style="width:110px" value="${esc(it.discount)}" oninput="App.setDraftItemField(${idx},'discount',this.value)"></td>
-            <td>${d.items.length > 1 ? `<button type="button" class="link-btn" onclick="App.removeDraftItemRow(${idx})">remove</button>` : ""}</td>
+            <td><input type="number" step="0.01" min="0" value="${esc(it.price)}" oninput="App.setDraftItemField(${idx},'price',this.value)"></td>
+            <td><input type="number" step="0.01" min="0" value="${esc(it.discount)}" oninput="App.setDraftItemField(${idx},'discount',this.value)"></td>
+            <td class="right">${d.items.length > 1 ? `<button type="button" class="link-btn" onclick="App.removeDraftItemRow(${idx})">remove</button>` : ""}</td>
           </tr>`).join("")}
         </tbody>
       </table>

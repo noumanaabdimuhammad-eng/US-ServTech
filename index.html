@@ -46,11 +46,26 @@
 
   /* ---- Login ---- */
   .login-wrap { min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 16px;
-    background: radial-gradient(1100px 700px at 18% 8%, #1e4a80 0%, var(--ink) 46%, #030c18 100%); }
-  .login-card { background: var(--card); border: 1px solid rgba(255,255,255,.06); border-radius: var(--radius-lg); padding: 40px; width: 100%; max-width: 408px; box-shadow: var(--shadow-lg); }
-  .login-card .login-brand { display: flex; align-items: center; gap: 12px; margin-bottom: 22px; }
+    background: linear-gradient(135deg, #0f2c58 0%, #1d4fc7 48%, #5b9bfb 100%); }
+  .login-card { background: var(--card); border: 1px solid rgba(255,255,255,.06); border-radius: 22px; padding: 44px 40px 38px; width: 100%; max-width: 420px; box-shadow: 0 30px 64px rgba(9,26,64,.28), var(--shadow-lg); text-align: center; }
+  .login-card .login-brand { display: flex; align-items: center; justify-content: center; gap: 12px; margin-bottom: 18px; }
   .login-card h1 { font-size: 20px; font-weight: 800; color: var(--ink); margin: 0; letter-spacing: -.015em; }
-  .login-card p.sub { color: var(--muted); font-size: 13.5px; margin: 0 0 26px; line-height: 1.5; }
+  .login-card h1.welcome { font-size: 29px; margin: 4px 0 7px; letter-spacing: -.02em; }
+  .login-card p.sub { color: var(--muted); font-size: 13.5px; margin: 0 0 28px; line-height: 1.5; text-align: center; }
+  .login-card form { text-align: left; }
+  .login-card .field input { background: #f2f4fa; border-color: #f2f4fa; padding: 12.5px 15px; border-radius: 12px; font-size: 14px; }
+  .login-card .field input:focus { background: #fff; border-color: var(--fin-accent); box-shadow: 0 0 0 3.5px var(--fin-accent-bg); }
+  .login-card .field label { font-size: 12.5px; font-weight: 700; color: var(--text); margin-bottom: 7px; }
+  .pw-field-wrap { position: relative; }
+  .pw-field-wrap input { padding-right: 44px !important; }
+  .pw-toggle { position: absolute; right: 6px; top: 50%; transform: translateY(-50%); background: none; border: none; cursor: pointer; color: var(--muted); padding: 6px; display: flex; border-radius: 8px; }
+  .pw-toggle:hover { color: var(--text); background: rgba(16,24,40,.05); }
+  .login-remember { display: flex; align-items: center; gap: 9px; margin: 2px 0 22px; }
+  .login-remember input[type="checkbox"] { width: 17px; height: 17px; accent-color: var(--fin-accent); cursor: pointer; margin: 0; }
+  .login-remember label { font-size: 13.5px; font-weight: 500; color: var(--text); cursor: pointer; margin: 0; }
+  .login-card .btn-primary { padding: 13px 18px; border-radius: 12px; font-size: 14.5px; background: linear-gradient(135deg, var(--fin-accent) 0%, var(--fin-accent-dark) 100%); }
+  .login-card .btn-primary:hover { background: linear-gradient(135deg, var(--fin-accent-dark) 0%, #163ea3 100%); }
+  .login-card .error-msg { text-align: center; }
   .field { margin-bottom: 15px; }
   .field label { display: block; font-size: 12px; font-weight: 600; color: var(--muted); margin-bottom: 5px; letter-spacing: .01em; }
   .field input, .field select, .field textarea { width: 100%; padding: 10px 12px; border: 1.5px solid var(--border); border-radius: var(--radius-sm); font-size: 14px; font-family: inherit; background: #fff; color: var(--text); transition: border-color .12s ease, box-shadow .12s ease; }
@@ -71,65 +86,98 @@
 
   /* ---- Logo mark (US ServTech company logo) ---- */
   .logo-badge { height: 30px; width: auto; flex: 0 0 auto; display: block; }
-  .login-card .logo-badge { height: 46px; }
+  .login-card .logo-badge { height: 76px; margin: 0 auto; }
 
-  /* ---- Shell: a fixed dark sidebar (nav + identity) beside the content ---- */
+  /* ---- Shell: a fixed dark sidebar (identity + module switch only — the
+     screens within a module live in the light top subnav bar, .topbar
+     below) beside the content ---- */
   .shell { display: flex; min-height: 100vh; }
   .sidebar { width: 258px; flex: 0 0 258px; background: linear-gradient(190deg, var(--ink-2) 0%, var(--ink) 62%, #061020 100%);
-    color: #fff; display: flex; flex-direction: column; position: sticky; top: 0; height: 100vh; overflow-y: auto;
-    box-shadow: 2px 0 18px rgba(4,10,22,.18); z-index: 20; }
+    color: #fff; display: flex; flex-direction: column; position: sticky; top: 0; height: 100vh; overflow-y: auto; overflow-x: hidden;
+    box-shadow: 2px 0 18px rgba(4,10,22,.18); z-index: 20; transition: width .16s ease, flex-basis .16s ease; }
+  .sidebar-collapse-toggle { position: absolute; top: 20px; right: -13px; width: 26px; height: 26px; border-radius: 50%;
+    background: var(--card); border: 1.5px solid var(--border); color: var(--ink); display: flex; align-items: center; justify-content: center;
+    cursor: pointer; box-shadow: var(--shadow-sm); z-index: 25; font-size: 13px; line-height: 1; padding: 0; }
+  .sidebar-collapse-toggle:hover { background: var(--border-soft); }
   .sidebar-brand { display: flex; align-items: center; gap: 11px; padding: 22px 20px 18px; border-bottom: 1px solid rgba(255,255,255,.08); }
-  .sidebar-title { font-family: 'Inter Tight', 'Inter', sans-serif; font-weight: 800; font-size: 15px; letter-spacing: -.01em; }
-  .sidebar-tag { font-weight: 400; color: rgba(255,255,255,.46); font-size: 10.5px; letter-spacing: .03em; margin-top: 1px; }
+  .sidebar-title { font-family: 'Inter Tight', 'Inter', sans-serif; font-weight: 800; font-size: 15px; letter-spacing: -.01em; white-space: nowrap; }
+  .sidebar-tag { font-weight: 400; color: rgba(255,255,255,.46); font-size: 10.5px; letter-spacing: .03em; margin-top: 1px; white-space: nowrap; }
+  .brand-text { min-width: 0; overflow: hidden; }
 
   .sidebar-profile { display: flex; align-items: center; gap: 11px; padding: 16px 20px; border-bottom: 1px solid rgba(255,255,255,.08); }
   .avatar { width: 36px; height: 36px; border-radius: 50%; background: linear-gradient(135deg, var(--op-accent), var(--fin-accent)); color: #fff;
     display: flex; align-items: center; justify-content: center; font-size: 13px; font-weight: 700; flex: 0 0 auto; letter-spacing: -.02em; }
   .avatar-sm { width: 30px; height: 30px; font-size: 11.5px; }
-  .who-text { min-width: 0; }
+  .who-text { min-width: 0; overflow: hidden; }
   .who-name { font-size: 13px; font-weight: 700; color: #fff; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .who-role { font-size: 11px; color: rgba(255,255,255,.6); display: flex; align-items: center; gap: 6px; margin-top: 2px; }
+  .who-role { font-size: 11px; color: rgba(255,255,255,.6); display: flex; align-items: center; gap: 6px; margin-top: 2px; white-space: nowrap; }
   .status-dot { width: 7px; height: 7px; border-radius: 50%; background: #22c55e; box-shadow: 0 0 0 2.5px rgba(34,197,94,.22); flex: 0 0 auto; }
 
   .sidebar-modules { display: flex; flex-direction: column; gap: 4px; padding: 14px 14px 6px; }
-  .sidebar-modules button { display: flex; align-items: center; gap: 9px; background: rgba(255,255,255,.05); border: 1px solid rgba(255,255,255,.07); color: rgba(255,255,255,.72);
-    padding: 9px 13px; border-radius: 9px; cursor: pointer; font-size: 12.5px; font-weight: 600; letter-spacing: .01em; text-align: left; transition: background-color .12s ease, color .12s ease, border-color .12s ease; }
-  .sidebar-modules button .mod-dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; opacity: .55; flex: 0 0 auto; }
+  .sidebar-modules button { display: flex; align-items: center; gap: 10px; background: rgba(255,255,255,.05); border: 1px solid rgba(255,255,255,.07); color: rgba(255,255,255,.72);
+    padding: 8px 12px; border-radius: 9px; cursor: pointer; font-size: 12.5px; font-weight: 600; letter-spacing: .01em; text-align: left; transition: background-color .12s ease, color .12s ease, border-color .12s ease; }
+  .sidebar-modules button .mod-icon { width: 21px; height: 21px; border-radius: 7px; background: rgba(255,255,255,.12); display: flex; align-items: center;
+    justify-content: center; font-size: 10.5px; font-weight: 800; flex: 0 0 auto; }
   .sidebar-modules button:hover { background: rgba(255,255,255,.09); color: #fff; }
   .sidebar-modules button.active.mod-operations { background: var(--op-accent); border-color: var(--op-accent); color: #fff; }
   .sidebar-modules button.active.mod-finance { background: var(--fin-accent); border-color: var(--fin-accent); color: #fff; }
-  .sidebar-modules button.active .mod-dot { opacity: 1; }
-
-  .sidebar-nav { flex: 1; padding: 12px 12px 10px; display: flex; flex-direction: column; gap: 1px; overflow-y: auto; }
-  .nav-group-label { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .07em; color: rgba(255,255,255,.34);
-    padding: 14px 12px 5px; }
-  .nav-group-label:first-child { padding-top: 4px; }
-  .nav-item { display: block; width: 100%; text-align: left; background: none; border: none; color: rgba(255,255,255,.68);
-    padding: 8.5px 13px; border-radius: 8px; cursor: pointer; font-size: 12.5px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-    transition: background-color .12s ease, color .12s ease; }
-  .nav-item:hover { background: rgba(255,255,255,.07); color: #fff; }
-  .nav-item.active { background: var(--accent); color: #fff; font-weight: 600; box-shadow: var(--shadow-sm); }
+  .sidebar-modules button.active .mod-icon { background: rgba(255,255,255,.22); }
+  .sidebar-label { white-space: nowrap; }
 
   .sidebar-signout { margin: 10px 14px 18px; background: rgba(255,255,255,.07); border: 1px solid rgba(255,255,255,.1); color: #fff;
-    padding: 9px 13px; border-radius: 9px; cursor: pointer; font-size: 12.5px; font-weight: 600; text-align: left; }
+    padding: 9px 12px; border-radius: 9px; cursor: pointer; font-size: 12.5px; font-weight: 600; text-align: left; display: flex; align-items: center; gap: 10px; }
   .sidebar-signout:hover { background: rgba(255,255,255,.13); }
+  .signout-icon { flex: 0 0 auto; font-size: 13px; width: 21px; text-align: center; }
 
   .sidebar-backdrop { display: none; }
+
+  /* ---- Collapsed sidebar: icons/avatar only, no text ---- */
+  .shell.sidebar-collapsed .sidebar { width: 76px; flex-basis: 76px; }
+  .shell.sidebar-collapsed .sidebar-brand { justify-content: center; padding-left: 8px; padding-right: 8px; }
+  .shell.sidebar-collapsed .brand-text,
+  .shell.sidebar-collapsed .who-text,
+  .shell.sidebar-collapsed .sidebar-label { display: none; }
+  .shell.sidebar-collapsed .sidebar-profile { justify-content: center; padding-left: 8px; padding-right: 8px; }
+  .shell.sidebar-collapsed .sidebar-modules { padding-left: 10px; padding-right: 10px; }
+  .shell.sidebar-collapsed .sidebar-modules button { justify-content: center; padding: 9px; }
+  .shell.sidebar-collapsed .sidebar-signout { justify-content: center; padding: 9px; margin-left: 10px; margin-right: 10px; }
+  .shell.sidebar-collapsed .sidebar-collapse-toggle { transform: scaleX(-1); }
 
   .main-col { flex: 1; min-width: 0; display: flex; flex-direction: column; }
   .topbar-mobile { display: none; }
 
-  main { max-width: 1180px; width: 100%; margin: 0 auto; padding: 28px 24px 64px; }
+  /* ---- Top subnav bar: every screen within the active module (Operations /
+     Finance), grouped for Finance — replaces the old in-sidebar nav list. ---- */
+  .topbar { background: var(--card); border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 10; }
+  .topbar-inner { max-width: 1180px; margin: 0 auto; padding: 12px 24px 0; }
+  .subnav-scroll { overflow-x: auto; overflow-y: hidden; padding-bottom: 10px; scrollbar-width: thin; }
+  .subnav { display: flex; align-items: center; gap: 4px; white-space: nowrap; width: max-content; min-width: 100%; }
+  .subnav-group { display: flex; align-items: center; gap: 3px; padding-right: 10px; margin-right: 8px; border-right: 1px solid var(--border-soft); }
+  .subnav-group:last-child { border-right: none; margin-right: 0; padding-right: 0; }
+  .subnav-group-label { font-size: 9.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin-right: 5px; flex: 0 0 auto; }
+  .subnav-item { background: none; border: 1px solid transparent; color: var(--muted); padding: 7px 13px; border-radius: 99px; cursor: pointer;
+    font-size: 12.5px; font-weight: 600; white-space: nowrap; flex: 0 0 auto; transition: background-color .12s ease, color .12s ease, border-color .12s ease; }
+  .subnav-item:hover { background: var(--accent-bg); color: var(--accent-dark); }
+  .subnav-item.active { background: var(--accent); color: #fff; box-shadow: var(--shadow-xs); }
 
-  /* ---- Narrow screens: sidebar becomes an off-canvas panel ---- */
+  main { max-width: 1180px; width: 100%; margin: 0 auto; padding: 24px 24px 64px; }
+
+  /* ---- Narrow screens: sidebar becomes an off-canvas panel (always full
+     width/expanded there — the collapse feature is desktop-only) ---- */
   @media (max-width: 860px) {
     .sidebar { position: fixed; left: 0; top: 0; transform: translateX(-100%); transition: transform .18s ease; width: 264px; flex-basis: 264px; }
     .shell.sidebar-open .sidebar { transform: translateX(0); }
     .shell.sidebar-open .sidebar-backdrop { display: block; position: fixed; inset: 0; background: rgba(6,12,24,.5); z-index: 19; }
+    .shell.sidebar-collapsed .sidebar { width: 264px; flex-basis: 264px; }
+    .shell.sidebar-collapsed .brand-text, .shell.sidebar-collapsed .who-text, .shell.sidebar-collapsed .sidebar-label { display: block; }
+    .shell.sidebar-collapsed .sidebar-modules button, .shell.sidebar-collapsed .sidebar-signout { justify-content: flex-start; }
+    .sidebar-collapse-toggle { display: none; }
     .topbar-mobile { display: flex; align-items: center; gap: 12px; background: var(--ink); color: #fff; height: 54px; padding: 0 16px;
       position: sticky; top: 0; z-index: 15; border-bottom: 1px solid rgba(255,255,255,.08); }
     .hamburger { background: none; border: none; color: #fff; font-size: 19px; cursor: pointer; padding: 4px 6px; line-height: 1; }
     .topbar-crumb { font-size: 12.5px; font-weight: 600; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .topbar { top: 54px; }
+    .topbar-inner { padding: 10px 16px 0; }
     main { padding: 20px 16px 48px; }
   }
   h2.page-title { font-size: 21px; font-weight: 800; color: var(--ink); margin: 0 0 5px; letter-spacing: -.015em; }
@@ -150,6 +198,22 @@
   tr.total-row td { border-top: 2px solid var(--ink); font-weight: 700; color: var(--ink); background: transparent; }
   tr.subtotal-row td { border-top: 1px solid var(--border); font-weight: 600; background: transparent; }
   td.indent { padding-left: 24px; }
+
+  /* Editable line-item tables (New inquiry's "Services required" grid and
+     similar) — gives the service picker/description/price/discount cells a
+     fixed, presentable column layout with properly styled controls, instead
+     of unstyled inputs sized by browser defaults. */
+  table.items-table { table-layout: fixed; }
+  table.items-table th:nth-child(1), table.items-table td:nth-child(1) { width: 17%; }
+  table.items-table th:nth-child(2), table.items-table td:nth-child(2) { width: 41%; }
+  table.items-table th:nth-child(3), table.items-table td:nth-child(3) { width: 15%; }
+  table.items-table th:nth-child(4), table.items-table td:nth-child(4) { width: 15%; }
+  table.items-table th:nth-child(5), table.items-table td:nth-child(5) { width: 12%; }
+  table.items-table td { vertical-align: middle; padding: 7px 8px; }
+  table.items-table select, table.items-table input { width: 100%; padding: 8px 10px; border: 1.5px solid var(--border); border-radius: var(--radius-sm);
+    font-size: 13px; font-family: inherit; background: #fff; color: var(--text); box-sizing: border-box; transition: border-color .12s ease, box-shadow .12s ease; }
+  table.items-table select:focus, table.items-table input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-bg); }
+  table.items-table input[type="number"] { text-align: right; }
 
   .pill { display: inline-flex; align-items: center; padding: 3px 10px; border-radius: 99px; font-size: 10.5px; font-weight: 700; letter-spacing: .01em; }
   .pill-delivered { background: var(--green-bg); color: var(--green); }
