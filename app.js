@@ -67,6 +67,17 @@ const MODULES = {
       { id: "fixedassets", label: "Fixed Assets" },
       { id: "periodclose", label: "Period Close" },
     ],
+    // Odoo-style segregation: the flat tab list above still drives routing
+    // (moduleForView, permissions, etc.) — this just groups those same tab
+    // ids into labeled clusters for the subnav, so Finance doesn't read as
+    // one long flat row. Whichever group contains the current view is the
+    // one shown expanded; clicking a group jumps to its first tab.
+    groups: [
+      { label: "Accounting", tabs: ["chartofaccounts", "journalentries", "generalledger", "bankaccounts"] },
+      { label: "Reports", tabs: ["trialbalance", "incomestatement", "balancesheet", "cashflow", "araging", "apaging"] },
+      { label: "Payroll & Assets", tabs: ["expenses", "employees", "payroll", "fixedassets"] },
+      { label: "Configuration", tabs: ["periodclose"] },
+    ],
   },
 };
 function moduleForView(view) {
@@ -1353,10 +1364,29 @@ function renderShell() {
   const moduleBtns = `
     <button class="mod-operations ${mod === "operations" ? "active" : ""}" onclick="App.switchModule('operations')">Operations</button>
     ${showFinance ? `<button class="mod-finance ${mod === "finance" ? "active" : ""}" onclick="App.switchModule('finance')">Finance</button>` : ""}`;
-  const tabs = MODULES[mod] ? MODULES[mod].tabs : MODULES.operations.tabs;
-  const subnavHtml = tabs.map((t) =>
-    `<button class="${state.view === t.id ? "active" : ""}" onclick="App.nav('${t.id}')">${t.label}</button>`
-  ).join("");
+  const modDef = MODULES[mod] || MODULES.operations;
+  // Modules with a `groups` array (currently just Finance) get a two-tier
+  // subnav — a row of section labels, then that section's own tabs — so a
+  // long flat list of screens reads as organized areas instead of one row.
+  // Modules without one (Operations) keep the original single-row subnav.
+  let subnavHtml;
+  if (modDef.groups) {
+    const tabById = {};
+    modDef.tabs.forEach((t) => { tabById[t.id] = t; });
+    const activeGroup = modDef.groups.find((g) => g.tabs.includes(state.view)) || modDef.groups[0];
+    const groupBtns = modDef.groups.map((g) =>
+      `<button class="${g === activeGroup ? "active" : ""}" onclick="App.nav('${g.tabs[0]}')">${esc(g.label)}</button>`
+    ).join("");
+    const itemBtns = activeGroup.tabs.map((id) =>
+      `<button class="${state.view === id ? "active" : ""}" onclick="App.nav('${id}')">${esc(tabById[id].label)}</button>`
+    ).join("");
+    subnavHtml = `<div class="subnav subnav-group">${groupBtns}</div><div class="subnav subnav-item">${itemBtns}</div>`;
+  } else {
+    const itemBtns = modDef.tabs.map((t) =>
+      `<button class="${state.view === t.id ? "active" : ""}" onclick="App.nav('${t.id}')">${esc(t.label)}</button>`
+    ).join("");
+    subnavHtml = `<div class="subnav">${itemBtns}</div>`;
+  }
   return `
   <div class="topbar">
     <div class="brand">${LOGO_MARK}<span>US ServTech<span class="tag">Operations &amp; Finance</span></span></div>
@@ -1365,7 +1395,7 @@ function renderShell() {
       <button class="btn btn-ghost btn-sm" onclick="App.logout()">Sign out</button>
     </div>
   </div>
-  <div class="subnav">${subnavHtml}</div>
+  ${subnavHtml}
   <main>${state.loading ? `<div class="empty-state">Loading…</div>` : renderView()}</main>
   <div id="toastHost">${toastHtml()}</div>`;
 }
