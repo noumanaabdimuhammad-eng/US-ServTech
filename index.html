@@ -73,37 +73,65 @@
   .logo-badge { height: 30px; width: auto; flex: 0 0 auto; display: block; }
   .login-card .logo-badge { height: 46px; }
 
-  /* ---- Shell: a calm top row (brand only) + a controls row beneath it ---- */
-  .topbar { background: var(--ink); color: #fff; padding: 0 26px; display: flex; align-items: center; justify-content: center; height: 60px;
-    position: sticky; top: 0; z-index: 12; border-bottom: 1px solid rgba(255,255,255,.07); }
-  .topbar .brand { display: flex; align-items: center; gap: 12px; font-weight: 700; font-size: 15.5px; letter-spacing: -.01em; white-space: nowrap; }
-  .topbar .brand span { font-family: 'Inter Tight', 'Inter', sans-serif; }
-  .topbar .brand .tag { font-weight: 400; font-family: 'Inter', sans-serif; color: rgba(255,255,255,.48); font-size: 11px; display: block; letter-spacing: .03em; margin-top: 1px; }
+  /* ---- Shell: a fixed dark sidebar (nav + identity) beside the content ---- */
+  .shell { display: flex; min-height: 100vh; }
+  .sidebar { width: 258px; flex: 0 0 258px; background: linear-gradient(190deg, var(--ink-2) 0%, var(--ink) 62%, #061020 100%);
+    color: #fff; display: flex; flex-direction: column; position: sticky; top: 0; height: 100vh; overflow-y: auto;
+    box-shadow: 2px 0 18px rgba(4,10,22,.18); z-index: 20; }
+  .sidebar-brand { display: flex; align-items: center; gap: 11px; padding: 22px 20px 18px; border-bottom: 1px solid rgba(255,255,255,.08); }
+  .sidebar-title { font-family: 'Inter Tight', 'Inter', sans-serif; font-weight: 800; font-size: 15px; letter-spacing: -.01em; }
+  .sidebar-tag { font-weight: 400; color: rgba(255,255,255,.46); font-size: 10.5px; letter-spacing: .03em; margin-top: 1px; }
 
-  .controlbar { background: var(--ink-2); color: #fff; padding: 0 26px; display: flex; align-items: center; height: 50px; gap: 18px;
-    border-bottom: 1px solid rgba(255,255,255,.06); }
-  .module-switch { display: flex; gap: 2px; background: rgba(255,255,255,.06); border-radius: 9px; padding: 3px; }
-  .module-switch button { background: none; border: none; color: rgba(255,255,255,.62); padding: 7px 15px; border-radius: 7px; cursor: pointer; font-size: 12.5px; font-weight: 600; letter-spacing: .01em; transition: background-color .12s ease, color .12s ease; }
-  .module-switch button:hover { color: #fff; }
-  .module-switch button.active.mod-operations { background: var(--op-accent); color: #fff; }
-  .module-switch button.active.mod-finance { background: var(--fin-accent); color: #fff; }
-  .controlbar .who { font-size: 12.5px; color: rgba(255,255,255,.68); display: flex; align-items: center; gap: 12px; margin-left: auto; white-space: nowrap; }
-  .controlbar .who b { color: #fff; font-weight: 600; }
-  .controlbar .who .btn-ghost { background: rgba(255,255,255,.08); color: #fff; border-color: rgba(255,255,255,.14); }
-  .controlbar .who .btn-ghost:hover { background: rgba(255,255,255,.16); }
+  .sidebar-profile { display: flex; align-items: center; gap: 11px; padding: 16px 20px; border-bottom: 1px solid rgba(255,255,255,.08); }
+  .avatar { width: 36px; height: 36px; border-radius: 50%; background: linear-gradient(135deg, var(--op-accent), var(--fin-accent)); color: #fff;
+    display: flex; align-items: center; justify-content: center; font-size: 13px; font-weight: 700; flex: 0 0 auto; letter-spacing: -.02em; }
+  .avatar-sm { width: 30px; height: 30px; font-size: 11.5px; }
+  .who-text { min-width: 0; }
+  .who-name { font-size: 13px; font-weight: 700; color: #fff; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .who-role { font-size: 11px; color: rgba(255,255,255,.6); display: flex; align-items: center; gap: 6px; margin-top: 2px; }
+  .status-dot { width: 7px; height: 7px; border-radius: 50%; background: #22c55e; box-shadow: 0 0 0 2.5px rgba(34,197,94,.22); flex: 0 0 auto; }
 
-  .subnav { background: var(--ink-2); padding: 0 26px; display: flex; gap: 4px; overflow-x: auto; position: sticky; top: 60px; z-index: 11; }
-  .subnav button { background: none; border: none; color: rgba(255,255,255,.58); padding: 11px 14px; cursor: pointer; font-size: 12.5px; font-weight: 500; white-space: nowrap; border-bottom: 2.5px solid transparent; transition: color .12s ease; }
-  .subnav button:hover { color: #fff; }
-  .subnav button.active { color: #fff; border-bottom-color: var(--accent); font-weight: 600; }
-  /* Finance's two-tier subnav: a row of section labels (Accounting, Reports,
-     Payroll & Assets, Configuration…) above that section's own tabs. */
-  .subnav.subnav-group { background: var(--ink-3); top: 60px; }
-  .subnav.subnav-group button { padding: 9px 14px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .05em; color: rgba(255,255,255,.46); border-bottom-width: 2px; }
-  .subnav.subnav-group button.active { color: #fff; }
-  .subnav.subnav-item { top: 92px; }
+  .sidebar-modules { display: flex; flex-direction: column; gap: 4px; padding: 14px 14px 6px; }
+  .sidebar-modules button { display: flex; align-items: center; gap: 9px; background: rgba(255,255,255,.05); border: 1px solid rgba(255,255,255,.07); color: rgba(255,255,255,.72);
+    padding: 9px 13px; border-radius: 9px; cursor: pointer; font-size: 12.5px; font-weight: 600; letter-spacing: .01em; text-align: left; transition: background-color .12s ease, color .12s ease, border-color .12s ease; }
+  .sidebar-modules button .mod-dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; opacity: .55; flex: 0 0 auto; }
+  .sidebar-modules button:hover { background: rgba(255,255,255,.09); color: #fff; }
+  .sidebar-modules button.active.mod-operations { background: var(--op-accent); border-color: var(--op-accent); color: #fff; }
+  .sidebar-modules button.active.mod-finance { background: var(--fin-accent); border-color: var(--fin-accent); color: #fff; }
+  .sidebar-modules button.active .mod-dot { opacity: 1; }
 
-  main { max-width: 1180px; margin: 0 auto; padding: 28px 24px 64px; }
+  .sidebar-nav { flex: 1; padding: 12px 12px 10px; display: flex; flex-direction: column; gap: 1px; overflow-y: auto; }
+  .nav-group-label { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .07em; color: rgba(255,255,255,.34);
+    padding: 14px 12px 5px; }
+  .nav-group-label:first-child { padding-top: 4px; }
+  .nav-item { display: block; width: 100%; text-align: left; background: none; border: none; color: rgba(255,255,255,.68);
+    padding: 8.5px 13px; border-radius: 8px; cursor: pointer; font-size: 12.5px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    transition: background-color .12s ease, color .12s ease; }
+  .nav-item:hover { background: rgba(255,255,255,.07); color: #fff; }
+  .nav-item.active { background: var(--accent); color: #fff; font-weight: 600; box-shadow: var(--shadow-sm); }
+
+  .sidebar-signout { margin: 10px 14px 18px; background: rgba(255,255,255,.07); border: 1px solid rgba(255,255,255,.1); color: #fff;
+    padding: 9px 13px; border-radius: 9px; cursor: pointer; font-size: 12.5px; font-weight: 600; text-align: left; }
+  .sidebar-signout:hover { background: rgba(255,255,255,.13); }
+
+  .sidebar-backdrop { display: none; }
+
+  .main-col { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+  .topbar-mobile { display: none; }
+
+  main { max-width: 1180px; width: 100%; margin: 0 auto; padding: 28px 24px 64px; }
+
+  /* ---- Narrow screens: sidebar becomes an off-canvas panel ---- */
+  @media (max-width: 860px) {
+    .sidebar { position: fixed; left: 0; top: 0; transform: translateX(-100%); transition: transform .18s ease; width: 264px; flex-basis: 264px; }
+    .shell.sidebar-open .sidebar { transform: translateX(0); }
+    .shell.sidebar-open .sidebar-backdrop { display: block; position: fixed; inset: 0; background: rgba(6,12,24,.5); z-index: 19; }
+    .topbar-mobile { display: flex; align-items: center; gap: 12px; background: var(--ink); color: #fff; height: 54px; padding: 0 16px;
+      position: sticky; top: 0; z-index: 15; border-bottom: 1px solid rgba(255,255,255,.08); }
+    .hamburger { background: none; border: none; color: #fff; font-size: 19px; cursor: pointer; padding: 4px 6px; line-height: 1; }
+    .topbar-crumb { font-size: 12.5px; font-weight: 600; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    main { padding: 20px 16px 48px; }
+  }
   h2.page-title { font-size: 21px; font-weight: 800; color: var(--ink); margin: 0 0 5px; letter-spacing: -.015em; }
   p.page-sub { color: var(--muted); font-size: 13.5px; line-height: 1.5; margin: 0 0 22px; max-width: 760px; }
 
@@ -136,14 +164,16 @@
   .pill-open { background: var(--fin-accent-bg); color: var(--fin-accent-dark); }
   .pill-closed { background: var(--slate-bg); color: var(--slate); }
 
+  /* Gradient-header stat tiles — a colored band names the metric, the
+     number sits in a plain white body below it. */
   .kpi-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 14px; margin-bottom: 22px; }
-  .kpi { position: relative; background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); padding: 17px 18px; box-shadow: var(--shadow-xs); overflow: hidden; }
-  .kpi::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; background: var(--border); }
-  .kpi .label { font-size: 11.5px; font-weight: 600; color: var(--muted); margin-bottom: 7px; text-transform: uppercase; letter-spacing: .03em; }
-  .kpi .value { font-size: 25px; font-weight: 800; color: var(--ink); font-variant-numeric: tabular-nums; letter-spacing: -.01em; }
-  .kpi.accent::before { background: var(--accent); }
-  .kpi.accent .value { color: var(--accent-dark); }
-  .kpi.negative::before { background: var(--red); }
+  .kpi { position: relative; background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); padding: 0; box-shadow: var(--shadow-xs); overflow: hidden;
+    display: flex; flex-direction: column; transition: box-shadow .14s ease, transform .1s ease; }
+  .kpi .label { font-size: 10.5px; font-weight: 700; color: #fff; margin: 0; padding: 11px 16px; text-transform: uppercase; letter-spacing: .05em;
+    background: linear-gradient(135deg, var(--accent) 0%, var(--accent-dark) 100%); }
+  .kpi .value { font-size: 25px; font-weight: 800; color: var(--ink); font-variant-numeric: tabular-nums; letter-spacing: -.01em; padding: 15px 18px 6px; }
+  .kpi.accent .label { background: linear-gradient(135deg, var(--accent-dark) 0%, var(--ink-2) 100%); }
+  .kpi.negative .label { background: linear-gradient(135deg, var(--red) 0%, #7a1610 100%); }
 
   .form-row { display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-end; }
   .form-row .field { flex: 1; min-width: 140px; margin-bottom: 0; }
@@ -173,13 +203,12 @@
   .balance-flag.bad { background: var(--red-bg); color: var(--red); }
 
   /* ---- Finance Dashboard ---- */
-  .kpi .hint { font-size: 11px; color: var(--muted); margin-top: 5px; }
+  .kpi .hint { font-size: 11px; color: var(--muted); padding: 0 18px 15px; margin: -4px 0 0; }
   .kpi.negative .value { color: var(--red); }
-  .kpi.clickable { cursor: pointer; transition: box-shadow .12s ease, transform .06s ease; user-select: none; }
-  .kpi.clickable:hover { box-shadow: var(--shadow-sm); transform: translateY(-1px); }
-  .kpi.selected::before { background: var(--kpi-color, var(--accent)); width: 4px; }
-  .kpi.selected { box-shadow: 0 0 0 1.5px var(--kpi-color, var(--accent)) inset, var(--shadow-xs); }
-  .kpi.selected .label { color: var(--kpi-color, var(--accent)); }
+  .kpi.clickable { cursor: pointer; transition: box-shadow .12s ease, transform .1s ease; user-select: none; }
+  .kpi.clickable:hover { box-shadow: var(--shadow-md); transform: translateY(-2px); }
+  .kpi.selected { box-shadow: 0 0 0 2px var(--kpi-color, var(--accent)) inset, var(--shadow-sm); }
+  .kpi.selected .label { background: linear-gradient(135deg, var(--kpi-color, var(--accent)) 0%, var(--ink-2) 100%); }
   .trend-legend button.leg-item { display: inline-flex; align-items: center; gap: 6px; background: none; border: none; cursor: pointer; font: inherit; font-size: 12px; color: var(--muted); padding: 3px 0; opacity: .55; }
   .trend-legend button.leg-item.active { opacity: 1; color: var(--text); font-weight: 600; }
   .dash-presets { display: flex; gap: 8px; flex-wrap: wrap; }

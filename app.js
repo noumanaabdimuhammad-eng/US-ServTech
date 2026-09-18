@@ -94,6 +94,7 @@ const MODULES = {
       { id: "employees", label: "Employees" },
       { id: "payroll", label: "Payroll" },
       { id: "assetregister", label: "Asset Register" },
+      { id: "importdata", label: "Import Data" },
       { id: "periodclose", label: "Period Close" },
       { id: "team", label: "Team" },
     ],
@@ -108,7 +109,7 @@ const MODULES = {
       { label: "Invoices & Expenses", tabs: ["financeinvoices", "cashcollections", "expenses"] },
       { label: "Reports", tabs: ["trialbalance", "incomestatement", "balancesheet", "cashflow", "araging", "apaging", "assetsliabilities"] },
       { label: "Payroll & Assets", tabs: ["employees", "payroll", "assetregister"] },
-      { label: "Configuration", tabs: ["periodclose", "team"] },
+      { label: "Configuration", tabs: ["importdata", "periodclose", "team"] },
     ],
   },
 };
@@ -200,6 +201,10 @@ const state = {
     trend: [], // last 6 months: [{ label, revenue, expense, netIncome, netCashFlow, cashOnHand, arOutstanding, apOutstanding }, ...]
   },
   tasksByParent: {},   // parent_id -> [task,...]
+  invoiceTasksByInvoice: {}, // invoice_id -> its own copy of line items (see loadInvoiceTasks)
+  importPreview: null, // { rows: [...], fileName } — the parsed-but-not-yet-committed Zoho import
+  importBusy: false,
+  importResult: null,  // { inserted_count, total_amount, skipped: [...] } from the last import
   expanded: {},        // "table:id" -> true
   inquiryDraft: null,  // the in-progress "New inquiry" form — see freshInquiryDraft()
   dashboardKpis: null,
@@ -207,6 +212,7 @@ const state = {
   authBusy: false,
   authError: "",
   toast: null,
+  sidebarOpen: false, // off-canvas sidebar state on narrow screens — ignored by the CSS above the mobile breakpoint
 };
 
 // ---------------------------------------------------------------- helpers
@@ -432,6 +438,22 @@ async function loadWorkOrders() {
 async function loadInvoices() {
   const { data, error } = await sb.from("invoices").select("*").order("created_at", { ascending: false }).limit(200);
   if (!error) state.invoices = data || [];
+}
+// Every invoice gets its own copy of its line items the moment it's
+// created (parent_type 'Invoice' tasks — see maybe_finalize_work_order and
+// import_historical_invoices), independent of whatever work order it came
+// from (imported historical invoices have none at all). Loading these in
+// bulk for whatever's currently in state.invoices is what lets the
+// Invoices screen show a real total for every row, not just ones whose
+// work order happened to already be expanded elsewhere.
+async function loadInvoiceTasks() {
+  const ids = state.invoices.map((i) => i.id);
+  if (!ids.length) { state.invoiceTasksByInvoice = {}; return; }
+  const { data, error } = await sb.from("tasks").select("*").eq("parent_type", "Invoice").in("parent_id", ids);
+  if (error) return;
+  const map = {};
+  (data || []).forEach((t) => { (map[t.parent_id] = map[t.parent_id] || []).push(t); });
+  state.invoiceTasksByInvoice = map;
 }
 async function loadLedger() {
   if (!canApproveOrManage()) return;
@@ -731,8 +753,9 @@ async function loadView(view) {
     if (view === "inquiries") await Promise.all([loadInquiries(), state.customers.length ? null : loadCustomers()]);
     if (view === "quotations") await Promise.all([loadQuotations(), state.customers.length ? null : loadCustomers()]);
     if (view === "workorders") await Promise.all([loadWorkOrders(), state.customers.length ? null : loadCustomers()]);
-    if (view === "invoices") await Promise.all([loadInvoices(), loadBankAccounts(), loadCashCollections()]);
-    if (view === "financeinvoices") await Promise.all([loadInvoices(), loadBankAccounts(), loadCashCollections()]);
+    if (view === "invoices") { await Promise.all([loadInvoices(), loadBankAccounts(), loadCashCollections()]); await loadInvoiceTasks(); }
+    if (view === "financeinvoices") { await Promise.all([loadInvoices(), loadBankAccounts(), loadCashCollections()]); await loadInvoiceTasks(); }
+    if (view === "importdata") await loadBankAccounts();
     if (view === "cashcollections") await Promise.all([loadInvoices(), loadBankAccounts(), loadLedger(), loadCashCollections()]);
     if (view === "expenses") await Promise.all([loadExpenses(), loadBankAccounts(), loadLedger()]);
     if (view === "employees") await loadEmployees();
@@ -896,7 +919,12 @@ App.logout = async function () {
 App.nav = function (view) {
   state.view = view;
   state.module = moduleForView(view);
+  state.sidebarOpen = false; // no-op on desktop (sidebar's always visible there); closes the off-canvas panel on mobile
   loadView(view);
+};
+App.toggleSidebar = function (v) {
+  state.sidebarOpen = typeof v === "boolean" ? v : !state.sidebarOpen;
+  render();
 };
 // Switching module jumps to that module's first tab. Finance is refused for
 // anyone but Owner/Manager here too — belt and braces on top of the RLS
@@ -1176,8 +1204,30 @@ App.addTask = async function (parentType, parentId, ev) {
   return false;
 };
 App.updateTaskStatus = async function (taskId, parentId, status) {
-  await guard(sb.from("tasks").update({ status }).eq("id", taskId));
+  try {
+    await guard(sb.from("tasks").update({ status }).eq("id", taskId));
+  } catch (e) {
+    render(); // revert the <select> to the real stored status — the DB rejected the change (e.g. completion gate)
+    return;
+  }
   await loadTasksFor(parentId);
+  render();
+};
+// Certificate/card number for one Work Order line item — required (per the
+// completion gate trigger, enforce_wo_completion_gate) before that item can
+// be marked Delivered, on every work order created since the gate shipped.
+App.updateTaskCertNumber = async function (taskId, parentId, value) {
+  await guard(sb.from("tasks").update({ cert_number: value.trim() || null }).eq("id", taskId));
+  await loadTasksFor(parentId);
+  render();
+};
+// The Odoo/ZATCA invoice reference for a whole work order — required (same
+// gate) before an Odoo-system work order can be fully Delivered.
+App.updateWoOdooNumber = async function (id, value) {
+  try {
+    await guard(sb.from("work_orders").update({ odoo_invoice_number: value.trim() || null }).eq("id", id));
+  } catch (e) { render(); return; }
+  await loadWorkOrders();
   render();
 };
 App.deleteTask = async function (taskId, parentId) {
@@ -1954,22 +2004,30 @@ function renderDisabled() {
     </div>
   </div>`;
 }
+// Turns a name/email into 1-2 letters for the sidebar/topbar avatar circle.
+function initialsFor(name) {
+  const s = (name || "").trim();
+  if (!s) return "?";
+  const parts = s.split(/\s+/).filter(Boolean);
+  if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
+  return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase();
+}
 function renderShell() {
   const mod = state.module;
   const showOperations = canViewOperations();
   const showFinance = canViewFinance();
   const moduleBtns = `
-    ${showOperations ? `<button class="mod-operations ${mod === "operations" ? "active" : ""}" onclick="App.switchModule('operations')">Operations</button>` : ""}
-    ${showFinance ? `<button class="mod-finance ${mod === "finance" ? "active" : ""}" onclick="App.switchModule('finance')">Finance</button>` : ""}`;
+    ${showOperations ? `<button class="mod-operations ${mod === "operations" ? "active" : ""}" onclick="App.switchModule('operations')"><span class="mod-dot"></span>Operations</button>` : ""}
+    ${showFinance ? `<button class="mod-finance ${mod === "finance" ? "active" : ""}" onclick="App.switchModule('finance')"><span class="mod-dot"></span>Finance</button>` : ""}`;
   const modDef = MODULES[mod] || MODULES.operations;
-  // Modules with a `groups` array (currently just Finance) get a two-tier
-  // subnav — a row of section labels, then that section's own tabs — so a
-  // long flat list of screens reads as organized areas instead of one row.
-  // Modules without one (Operations) keep the original single-row subnav.
-  // Finance additionally filters both tiers down to whatever this role may
-  // actually reach (financeVisibleTabIds()) — e.g. an Approver only ever
-  // sees the "Invoices & Expenses" group, and only Owner sees "Team".
-  let subnavHtml;
+  // Modules with a `groups` array (currently just Finance) get their nav
+  // rendered as labeled sections (a bit like the "INSPECTION / ASSESSMENT
+  // REPORT" clusters in a typical ops-console sidebar) instead of one flat
+  // list — so a long list of screens reads as organized areas. Finance also
+  // filters everything down to whatever this role may actually reach
+  // (financeVisibleTabIds()) — e.g. an Approver only ever sees the
+  // "Invoices & Expenses" group, and only Owner sees "Team".
+  let navHtml;
   if (modDef.groups) {
     const visibleIds = mod === "finance" ? financeVisibleTabIds() : modDef.tabs.map((t) => t.id);
     const tabById = {};
@@ -1977,32 +2035,39 @@ function renderShell() {
     const visibleGroups = modDef.groups
       .map((g) => ({ ...g, tabs: g.tabs.filter((id) => visibleIds.includes(id)) }))
       .filter((g) => g.tabs.length);
-    const activeGroup = visibleGroups.find((g) => g.tabs.includes(state.view)) || visibleGroups[0] || { tabs: [] };
-    const groupBtns = visibleGroups.map((g) =>
-      `<button class="${g === activeGroup ? "active" : ""}" onclick="App.nav('${g.tabs[0]}')">${esc(g.label)}</button>`
-    ).join("");
-    const itemBtns = activeGroup.tabs.map((id) =>
-      `<button class="${state.view === id ? "active" : ""}" onclick="App.nav('${id}')">${esc(tabById[id].label)}</button>`
-    ).join("");
-    subnavHtml = `<div class="subnav subnav-group">${groupBtns}</div><div class="subnav subnav-item">${itemBtns}</div>`;
+    navHtml = visibleGroups.map((g) => `
+      <div class="nav-group-label">${esc(g.label)}</div>
+      ${g.tabs.map((id) => `<button class="nav-item ${state.view === id ? "active" : ""}" onclick="App.nav('${id}')">${esc(tabById[id].label)}</button>`).join("")}
+    `).join("");
   } else {
-    const itemBtns = modDef.tabs.map((t) =>
-      `<button class="${state.view === t.id ? "active" : ""}" onclick="App.nav('${t.id}')">${esc(t.label)}</button>`
+    navHtml = modDef.tabs.map((t) =>
+      `<button class="nav-item ${state.view === t.id ? "active" : ""}" onclick="App.nav('${t.id}')">${esc(t.label)}</button>`
     ).join("");
-    subnavHtml = `<div class="subnav">${itemBtns}</div>`;
   }
+  const displayName = state.profile.name || state.session.user.email;
+  const crumb = (MODULES[mod] && MODULES[mod].tabs.find((t) => t.id === state.view)) || { label: "" };
   return `
-  <div class="topbar">
-    <div class="brand">${LOGO_MARK}<span>US ServTech<span class="tag">Operations &amp; Finance</span></span></div>
-  </div>
-  <div class="controlbar">
-    <div class="module-switch">${moduleBtns}</div>
-    <div class="who"><b>${esc(state.profile.name || state.session.user.email)}</b> · ${esc(state.profile.role)}
-      <button class="btn btn-ghost btn-sm" onclick="App.logout()">Sign out</button>
+  <div class="shell ${state.sidebarOpen ? "sidebar-open" : ""}">
+    <aside class="sidebar">
+      <div class="sidebar-brand">${LOGO_MARK}<div><div class="sidebar-title">US ServTech</div><div class="sidebar-tag">Operations &amp; Finance</div></div></div>
+      <div class="sidebar-profile">
+        <div class="avatar">${esc(initialsFor(displayName))}</div>
+        <div class="who-text"><div class="who-name">${esc(displayName)}</div><div class="who-role"><span class="status-dot"></span>${esc(state.profile.role)}</div></div>
+      </div>
+      <div class="sidebar-modules">${moduleBtns}</div>
+      <nav class="sidebar-nav">${navHtml}</nav>
+      <button class="sidebar-signout" onclick="App.logout()">Sign out</button>
+    </aside>
+    <div class="sidebar-backdrop" onclick="App.toggleSidebar(false)"></div>
+    <div class="main-col">
+      <div class="topbar-mobile">
+        <button class="hamburger" onclick="App.toggleSidebar(true)" aria-label="Open menu">☰</button>
+        <div class="topbar-crumb">${esc(MODULES[mod] ? MODULES[mod].label : "")}${crumb.label ? " · " + esc(crumb.label) : ""}</div>
+        <div class="avatar avatar-sm">${esc(initialsFor(displayName))}</div>
+      </div>
+      <main>${state.loading ? `<div class="empty-state">Loading…</div>` : renderView()}</main>
     </div>
   </div>
-  ${subnavHtml}
-  <main>${state.loading ? `<div class="empty-state">Loading…</div>` : renderView()}</main>
   <div id="toastHost">${toastHtml()}</div>`;
 }
 function renderView() {
@@ -2033,6 +2098,7 @@ function renderView() {
     case "araging": return isMgmt() ? renderARAging() : mgmtOnlyView();
     case "apaging": return isMgmt() ? renderAPAging() : mgmtOnlyView();
     case "periodclose": return isMgmt() ? renderPeriodClose() : mgmtOnlyView();
+    case "importdata": return isMgmt() ? renderImportData() : mgmtOnlyView();
     default: return "";
   }
 }
@@ -2141,7 +2207,7 @@ function renderCustomerEditor(c) {
 // that's what's costed and certified differently downstream.
 const SERVICE_TYPES = ["Calibration", "Inspection", "Card"];
 
-function renderTasksEditor(parentType, parentId, discount, accountingSystem, showStatus) {
+function renderTasksEditor(parentType, parentId, discount, accountingSystem, showStatus, wo) {
   const tasks = state.tasksByParent[parentId] || [];
   const t = taskTotals(tasks, discount, accountingSystem);
   // A work order's line items are fixed the moment it's created — they come
@@ -2155,10 +2221,27 @@ function renderTasksEditor(parentType, parentId, discount, accountingSystem, sho
   const itemsLocked = parentType === "Work Order";
   const canWrite = canOpsWrite();
   const showRemoveCol = !itemsLocked && canWrite;
+  // Certificate/card # and the Odoo reference # only apply to Work Order
+  // items, and only bite for work orders created after the completion-gate
+  // feature shipped (wo.requires_completion_gate) — see
+  // enforce_wo_completion_gate(). Older work orders still show the field
+  // (it's still useful to record) but nothing blocks their completion over it.
+  const showCertCol = itemsLocked && showStatus;
+  const gateActive = !!(wo && wo.requires_completion_gate);
   return `
   <div class="wo-detail">
+    ${itemsLocked && wo ? `
+    <div class="form-row" style="margin-bottom:12px">
+      <div class="field"><label>Work order status</label>${statusPill(wo.status)}${gateActive ? "" : `<span class="subtle" style="margin-left:6px">— created before the completion-gate update, so it's exempt</span>`}</div>
+      ${wo.accounting_system === "Odoo" ? `
+      <div class="field"><label>Odoo / ZATCA invoice #${gateActive ? " *" : ""}</label>
+        ${canWrite
+          ? `<input value="${esc(wo.odoo_invoice_number || "")}" placeholder="${gateActive ? "Required before this order can be completed" : "Optional"}" onchange="App.updateWoOdooNumber('${wo.id}',this.value)">`
+          : (esc(wo.odoo_invoice_number) || "<span class=\"subtle\">not set</span>")}
+      </div>` : ""}
+    </div>` : ""}
     <table>
-      <thead><tr><th>Service</th><th>Description</th><th class="right">Price (SAR)</th><th class="right">Discount (SAR)</th>${showStatus ? "<th>Status</th>" : ""}${showRemoveCol ? "<th></th>" : ""}</tr></thead>
+      <thead><tr><th>Service</th><th>Description</th><th class="right">Price (SAR)</th><th class="right">Discount (SAR)</th>${showCertCol ? "<th>Cert / card #</th>" : ""}${showStatus ? "<th>Status</th>" : ""}${showRemoveCol ? "<th></th>" : ""}</tr></thead>
       <tbody>
         ${tasks.length ? tasks.map((tk) => {
           const statusLocked = showStatus && (tk.status === "Delivered" || !canWrite);
@@ -2168,6 +2251,11 @@ function renderTasksEditor(parentType, parentId, discount, accountingSystem, sho
             <td>${esc(tk.description)}</td>
             <td class="right">${fmtMoney(tk.price)}</td>
             <td class="right">${fmtMoney(tk.discount)}</td>
+            ${showCertCol ? `<td>
+              ${statusLocked
+                ? (esc(tk.cert_number) || "<span class=\"subtle\">—</span>")
+                : `<input style="width:130px" value="${esc(tk.cert_number || "")}" placeholder="${gateActive ? "Required" : "Optional"}" onchange="App.updateTaskCertNumber('${tk.id}','${parentId}',this.value)">`}
+            </td>` : ""}
             ${showStatus ? `<td>
               ${statusLocked
                 ? `${statusPill(tk.status)}${tk.status === "Delivered" ? `<div class="subtle">locked — final</div>` : ""}`
@@ -2177,7 +2265,7 @@ function renderTasksEditor(parentType, parentId, discount, accountingSystem, sho
             </td>` : ""}
             ${showRemoveCol ? `<td><button class="link-btn" onclick="App.deleteTask('${tk.id}','${parentId}')">remove</button></td>` : ""}
           </tr>`;
-        }).join("") : `<tr><td colspan="${showStatus ? 6 : 5}" class="empty-state">No line items yet.</td></tr>`}
+        }).join("") : `<tr><td colspan="${4 + (showCertCol ? 1 : 0) + (showStatus ? 1 : 0) + (showRemoveCol ? 1 : 0)}" class="empty-state">No line items yet.</td></tr>`}
       </tbody>
     </table>
     ${itemsLocked
@@ -2369,7 +2457,7 @@ function statusPillForQuote(s) {
 function renderWorkOrders() {
   return `
   <h2 class="page-title">Work Orders</h2>
-  <p class="page-sub">Work orders come from Inquiries — convert one directly, or accept its Quotation. Line items are fixed the moment a work order is created — no one can add or remove one afterward. Mark each item Delivered as it's finished; once every item on an order is Delivered, its invoice and revenue posting happen by themselves, and a Delivered item's status is then locked for good.</p>
+  <p class="page-sub">Work orders come from Inquiries — convert one directly, or accept its Quotation. Line items are fixed the moment a work order is created — no one can add or remove one afterward. Mark each item Delivered as it's finished; once every item on an order is Delivered, its invoice and revenue posting happen by themselves, and a Delivered item's status is then locked for good. Every item needs its own certificate/card number before it can be marked Delivered, and an Odoo-system order also needs its Odoo invoice number before it can be completed — work orders created before this update are exempt.</p>
   <div class="card">
     <table>
       <thead><tr><th>No.</th><th>Customer</th><th>Date</th><th>Status</th><th>Invoice</th><th></th></tr></thead>
@@ -2385,7 +2473,7 @@ function renderWorkOrders() {
             <td>${inv ? esc(inv.invoice_number) + " " + pill(inv.payment_status, inv.payment_status === "Paid" ? "paid" : "unpaid") : "—"}</td>
             <td onclick="event.stopPropagation()">${!w.cancelled && canOpsWrite() ? `<button class="btn btn-ghost btn-sm" onclick="App.cancelWorkOrder('${w.id}')">Cancel</button>` : ""}</td>
           </tr>
-          ${open ? `<tr><td colspan="6">${renderTasksEditor("Work Order", w.id, w.discount, w.accounting_system, true)}</td></tr>` : ""}`;
+          ${open ? `<tr><td colspan="6">${renderTasksEditor("Work Order", w.id, w.discount, w.accounting_system, true, w)}</td></tr>` : ""}`;
         }).join("") : `<tr><td colspan="6" class="empty-state">No work orders yet.</td></tr>`}
       </tbody>
     </table>
@@ -2449,6 +2537,35 @@ function renderInvoicePaidCell(inv) {
   }
   return html;
 }
+// Every invoice's total is computed from its OWN copy of its line items
+// (state.invoiceTasksByInvoice — loaded in bulk by loadInvoiceTasks, see
+// loadView) minus its work order's order-level discount, if it has one.
+// This is the same source invoice_total()/AR Aging use server-side, so it's
+// always available here too — including for invoices imported from Zoho,
+// which have no work order at all.
+function invoiceDisplayTotal(inv) {
+  const tasks = state.invoiceTasksByInvoice[inv.id] || [];
+  if (!tasks.length) return null;
+  const wo = state.workOrders.find((w) => w.id === inv.wo_id);
+  return taskTotals(tasks, wo ? wo.discount : 0, inv.accounting_system).total;
+}
+App.exportInvoices = function () {
+  const rows = state.invoices.map((inv) => {
+    const wo = state.workOrders.find((w) => w.id === inv.wo_id);
+    return {
+      "Invoice #": inv.invoice_number,
+      "Work order": wo ? wo.wo_number : "— (imported)",
+      "Customer": inv.customer,
+      "Date": inv.invoice_date,
+      "Accounting system": inv.accounting_system || "",
+      "Total (SAR)": invoiceDisplayTotal(inv) || 0,
+      "Status": inv.payment_status,
+      "Paid via": inv.paid_from ? ((state.bankAccounts.find((b) => b.id === inv.paid_from) || {}).name || "") : "",
+      "Paid at": inv.paid_at ? fmtDateTime(inv.paid_at) : "",
+    };
+  });
+  exportRowsToExcel(`invoices-${todayStamp()}.xlsx`, [{ name: "Invoices", rows }]);
+};
 function renderInvoices() {
   const showActionCol = canApproveOrManage() || canOpsWrite();
   return `
@@ -2456,18 +2573,18 @@ function renderInvoices() {
   <p class="page-sub">Invoices appear here automatically once a work order is fully delivered. Most sales are cash — log what you collect below; it's marked Paid once Owner/Manager confirms the handover on Finance → Cash Collections.</p>
   ${renderMyCashSummary()}
   <div class="card">
+    <div style="display:flex;justify-content:flex-end;margin-bottom:10px"><button class="btn btn-ghost btn-sm" onclick="App.exportInvoices()">Export to Excel</button></div>
     <table>
       <thead><tr><th>No.</th><th>Work order</th><th>Customer</th><th>Date</th><th class="right">Total (SAR)</th><th>Status</th>${showActionCol ? "<th>Payment</th>" : ""}</tr></thead>
       <tbody>
         ${state.invoices.length ? state.invoices.map((inv) => {
           const wo = state.workOrders.find((w) => w.id === inv.wo_id);
-          const tasks = wo ? (state.tasksByParent[wo.id] || null) : null;
-          const total = tasks ? taskTotals(tasks, wo.discount, wo.accounting_system).total : null;
+          const total = invoiceDisplayTotal(inv);
           return `
           <tr>
-            <td>${esc(inv.invoice_number)}</td><td>${wo ? esc(wo.wo_number) : "—"}</td><td>${esc(inv.customer)}</td>
+            <td>${esc(inv.invoice_number)}</td><td>${wo ? esc(wo.wo_number) : "<span class=\"subtle\">— imported</span>"}</td><td>${esc(inv.customer)}</td>
             <td>${fmtDate(inv.invoice_date)}</td>
-            <td class="right">${total !== null ? fmtMoney(total) : `<button class="link-btn" onclick="App.toggle('workorders','${wo ? wo.id : ""}');App.nav('workorders')">view on work order</button>`}</td>
+            <td class="right">${total !== null ? fmtMoney(total) : "—"}</td>
             <td>${pill(inv.payment_status, inv.payment_status === "Paid" ? "paid" : "unpaid")}${inv.paid_at ? `<div class="subtle">${fmtDateTime(inv.paid_at)}</div>` : ""}</td>
             ${showActionCol ? `<td>${renderInvoicePaidCell(inv)}</td>` : ""}
           </tr>`;
@@ -2550,6 +2667,161 @@ function renderCashCollections() {
         </tr>`).join("")}
       </tbody>
     </table>
+  </div>` : ""}`;
+}
+
+// ---------------------------------------------------------- Import Data
+
+// Historical Zoho invoices, brought in from an Excel file — Owner/Manager
+// only (see import_historical_invoices()). Header names are matched
+// case/spacing-insensitively against IMPORT_FIELD_MAP, so the template
+// below isn't the only spelling that works, just the reliable one.
+const IMPORT_FIELD_MAP = {
+  customername: "customer_name", customer: "customer_name",
+  invoicenumber: "invoice_number", invoiceno: "invoice_number", "invoice#": "invoice_number",
+  invoicedate: "invoice_date", date: "invoice_date",
+  description: "description", item: "description", serviceitem: "description",
+  amount: "amount", amountsar: "amount", subtotal: "amount",
+  accountingsystem: "accounting_system", system: "accounting_system",
+  paymentstatus: "payment_status", status: "payment_status",
+  paiddate: "paid_date",
+  paidvia: "paid_via", bank: "paid_via", paidfrom: "paid_via",
+  vatregno: "vat_reg_no", vatregistrationno: "vat_reg_no",
+  notes: "notes", note: "notes",
+};
+function normalizeHeader(h) {
+  return String(h || "").toLowerCase().replace(/[^a-z0-9#]/g, "");
+}
+function excelDateToIso(v) {
+  if (!v && v !== 0) return "";
+  if (v instanceof Date) return v.toISOString().slice(0, 10);
+  const s = String(v).trim();
+  if (/^\d{4}-\d{2}-\d{2}/.test(s)) return s.slice(0, 10);
+  const d = new Date(s);
+  return isNaN(d.getTime()) ? s : d.toISOString().slice(0, 10);
+}
+function importRowIssues(r) {
+  const issues = [];
+  if (!r.customer_name) issues.push("missing customer");
+  if (!r.invoice_number) issues.push("missing invoice #");
+  if (!r.invoice_date) issues.push("missing/unreadable date");
+  if (!r.amount || isNaN(Number(r.amount)) || Number(r.amount) <= 0) issues.push("missing/invalid amount");
+  if (!r.accounting_system || !["Odoo", "Zoho"].includes(r.accounting_system)) issues.push("system must be Odoo or Zoho");
+  const pay = r.payment_status || "Unpaid";
+  if (!["Paid", "Unpaid"].includes(pay)) issues.push("payment status must be Paid or Unpaid");
+  if (pay === "Paid") {
+    if (!r.paid_via) issues.push("Paid rows need Paid Via");
+    else if (!state.bankAccounts.some((b) => b.name.toLowerCase() === r.paid_via.toLowerCase())) issues.push(`unknown bank "${r.paid_via}"`);
+  }
+  return issues;
+}
+App.downloadImportTemplate = function () {
+  exportRowsToExcel("zoho-invoice-import-template.xlsx", [{
+    name: "Invoices",
+    rows: [{
+      "Customer Name": "Acme Factory LLC", "Invoice Number": "ZOHO-INV-00123", "Invoice Date": "2026-01-15",
+      "Description": "Calibration - Torque wrench 0-200 Nm", "Amount": 850, "Accounting System": "Odoo",
+      "Payment Status": "Paid", "Paid Date": "2026-01-20", "Paid Via": "BSF", "VAT Reg No": "", "Notes": "",
+    }],
+  }]);
+};
+App.handleImportFile = function (ev) {
+  const file = ev.target.files && ev.target.files[0];
+  if (!file) return;
+  if (typeof XLSX === "undefined") { showToast("Excel import isn't available right now — try reloading the page", true); return; }
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    try {
+      const wb = XLSX.read(new Uint8Array(e.target.result), { type: "array", cellDates: true });
+      const ws = wb.Sheets[wb.SheetNames[0]];
+      const raw = XLSX.utils.sheet_to_json(ws, { defval: "" });
+      const rows = raw.map((r) => {
+        const out = {};
+        Object.keys(r).forEach((k) => {
+          const field = IMPORT_FIELD_MAP[normalizeHeader(k)];
+          if (!field || r[k] === "") return;
+          out[field] = field.includes("date") ? excelDateToIso(r[k]) : String(r[k]).trim();
+        });
+        return out;
+      }).filter((r) => Object.keys(r).length);
+      if (!rows.length) { showToast("No readable rows found in that file", true); return; }
+      state.importPreview = { rows, fileName: file.name };
+      state.importResult = null;
+      render();
+    } catch (err) {
+      showToast("Couldn't read that file — make sure it's the .xlsx template", true);
+    }
+  };
+  reader.readAsArrayBuffer(file);
+  ev.target.value = "";
+};
+App.clearImportPreview = function () {
+  state.importPreview = null;
+  state.importResult = null;
+  render();
+};
+App.confirmImport = async function () {
+  if (!state.importPreview || !state.importPreview.rows.length || state.importBusy) return;
+  state.importBusy = true;
+  render();
+  const { data, error } = await sb.rpc("import_historical_invoices", { p_rows: state.importPreview.rows });
+  state.importBusy = false;
+  if (error) { showToast(error.message, true); render(); return; }
+  state.importResult = data;
+  state.importPreview = null;
+  showToast(`Imported ${data.inserted_count} invoice(s) — SAR ${fmtMoney(data.total_amount)}${data.skipped && data.skipped.length ? `, ${data.skipped.length} skipped (see below)` : ""}`, data.inserted_count === 0);
+  await Promise.all([loadCustomers(), loadBankAccounts()]);
+  render();
+};
+function renderImportData() {
+  const preview = state.importPreview;
+  const rowsWithIssues = preview ? preview.rows.map((r) => ({ r, issues: importRowIssues(r) })) : [];
+  const okCount = rowsWithIssues.filter((x) => !x.issues.length).length;
+  const sampleBank = (state.bankAccounts[0] || {}).name || "BSF";
+  return `
+  <h2 class="page-title">Import Data</h2>
+  <p class="page-sub">Bring your historical Zoho invoices in from Excel — each row becomes a customer (matched by name, or created fresh) and a finished invoice with the right VAT and payment status already applied, exactly as if it had been entered here all along. Nothing here reopens old jobs as active work orders.</p>
+  <div class="card">
+    <h3 style="margin-top:0">1. Download the template</h3>
+    <p class="subtle">One row per invoice. Required: Customer Name, Invoice Number, Invoice Date, Amount, Accounting System (Odoo or Zoho). Payment Status defaults to Unpaid — set it to Paid and fill in Paid Date + Paid Via (must match a bank account name exactly, e.g. "${esc(sampleBank)}" or "Cash in Hand") for invoices you've already collected.</p>
+    <button class="btn btn-ghost btn-sm" onclick="App.downloadImportTemplate()">Download template (.xlsx)</button>
+  </div>
+  <div class="card">
+    <h3 style="margin-top:0">2. Upload your filled-in file</h3>
+    <input type="file" accept=".xlsx,.xls" onchange="App.handleImportFile(event)">
+    ${preview ? `<p class="subtle" style="margin-top:8px">${esc(preview.fileName)} — ${preview.rows.length} row(s) read, ${okCount} look ready to import.</p>` : ""}
+  </div>
+  ${preview && preview.rows.length ? `
+  <div class="card">
+    <h3 style="margin-top:0">3. Review &amp; confirm</h3>
+    <table>
+      <thead><tr><th>Customer</th><th>Invoice #</th><th>Date</th><th class="right">Amount</th><th>System</th><th>Payment</th><th>Issues</th></tr></thead>
+      <tbody>
+        ${rowsWithIssues.map(({ r, issues }) => `
+        <tr>
+          <td>${esc(r.customer_name) || "—"}</td><td>${esc(r.invoice_number) || "—"}</td><td>${esc(r.invoice_date) || "—"}</td>
+          <td class="right">${esc(r.amount) || "—"}</td><td>${esc(r.accounting_system) || "—"}</td>
+          <td>${esc(r.payment_status || "Unpaid")}${r.paid_via ? " via " + esc(r.paid_via) : ""}</td>
+          <td>${issues.length ? `<span class="subtle" style="color:#b91c1c">${esc(issues.join(", "))}</span>` : "✓ looks good"}</td>
+        </tr>`).join("")}
+      </tbody>
+    </table>
+    <div style="margin-top:12px;display:flex;gap:10px">
+      <button class="btn btn-primary" ${state.importBusy ? "disabled" : ""} onclick="App.confirmImport()">${state.importBusy ? "Importing…" : `Import ${preview.rows.length} row(s)`}</button>
+      <button class="btn btn-ghost" onclick="App.clearImportPreview()">Cancel</button>
+    </div>
+    <p class="subtle" style="margin-top:8px">Flagged rows are still sent — the database does the final check and reports exactly why any row didn't import, so you can fix just those and re-upload them alone.</p>
+  </div>` : ""}
+  ${state.importResult ? `
+  <div class="card">
+    <h3 style="margin-top:0">Last import result</h3>
+    <p>Imported <b>${state.importResult.inserted_count}</b> invoice(s) totalling <b>SAR ${fmtMoney(state.importResult.total_amount)}</b>.</p>
+    ${state.importResult.skipped && state.importResult.skipped.length ? `
+    <p class="subtle">${state.importResult.skipped.length} row(s) skipped:</p>
+    <table>
+      <thead><tr><th>Row</th><th>Customer</th><th>Invoice #</th><th>Reason</th></tr></thead>
+      <tbody>${state.importResult.skipped.map((s) => `<tr><td>${s.row}</td><td>${esc(s.customer)}</td><td>${esc(s.invoice_number)}</td><td>${esc(s.reason)}</td></tr>`).join("")}</tbody>
+    </table>` : `<p class="subtle">Every row imported cleanly.</p>`}
   </div>` : ""}`;
 }
 
