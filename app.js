@@ -2,11 +2,19 @@
 // Vanilla JS single-page app. No build step, no framework.
 // Backend: Supabase (Postgres + Auth + Realtime). All numbering, invoice
 // generation, revenue posting and ledger balances are computed server-side
-// by database triggers/functions. The app is split into two modules:
-// Operations (Dashboard through Invoices — every role) and Finance (Chart
-// of Accounts through Period Close — Owner/Manager only, which is also how
-// the database's own row-level security already gates every finance table,
-// so an Officer calling a finance RPC directly gets nothing back either).
+// by database triggers/functions. The app is split into two modules —
+// Operations (Dashboard through Invoices) and Finance (Chart of Accounts
+// through Period Close, plus the Owner-only Team screen) — and five roles:
+// Owner and Manager get everything; Operations Staff gets full Operations,
+// no Finance; Viewer gets read-only Operations, no Finance; Approver gets
+// only Finance's Invoices & Expenses corner (mark invoices paid, approve/
+// reject/pay expenses). See OPS_WRITE_ROLES/OPS_VIEW_ROLES/FINANCE_VIEW_ROLES
+// below for the exact boundaries. All of it is independently enforced by the
+// database's own row-level security on every table — and, for the handful
+// of RPCs that bypass RLS by being SECURITY DEFINER, by an explicit role
+// check inside each function — so a role calling something directly it
+// isn't UI-offered gets nothing back either; this file's gating is for a
+// clean UI, not the actual security boundary.
 // Automated postings (revenue, payments, expenses, payroll, depreciation)
 // still happen entirely server-side via triggers, exactly as before. This
 // file adds exactly one way to write a journal entry by hand — the manual
@@ -31,6 +39,23 @@ const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 const VAT_RATE = 0.15;
 
 const MGMT_ROLES = ["Owner", "Manager"];
+// Five roles as of the RBAC rollout: Owner/Manager unchanged (full access to
+// everything). Operations Staff = full Operations, no Finance at all. Viewer
+// = read-only across Operations, no Finance at all. Approver = Finance only,
+// and only its Invoices & Expenses corner (mark invoices paid, approve/
+// reject/pay expenses) — no Payroll, Journal Entries, Reports, Chart of
+// Accounts management, or Employees. All of this is independently enforced
+// by RLS on every table (and, for the handful of RPCs that bypass RLS by
+// being SECURITY DEFINER, by an explicit role check inside each function) —
+// these helpers just keep the UI from offering controls that would fail.
+const OPS_WRITE_ROLES = ["Owner", "Manager", "Operations Staff"];
+const OPS_VIEW_ROLES = ["Owner", "Manager", "Operations Staff", "Viewer"];
+const FINANCE_VIEW_ROLES = ["Owner", "Manager", "Approver"];
+// The only two Finance tabs an Approver can reach — see MODULES.finance.groups' "Invoices & Expenses".
+const APPROVER_FINANCE_TABS = ["financeinvoices", "expenses"];
+// Every role the Team screen's role picker offers, and every role the
+// manage-employee Edge Function accepts on account creation.
+const ALL_ROLES = ["Owner", "Manager", "Operations Staff", "Approver", "Viewer"];
 
 // Two modules. Operations is everything through Invoices, for every role.
 // Finance is Chart of Accounts onward — gated to Owner/Manager both in the
@@ -69,6 +94,7 @@ const MODULES = {
       { id: "payroll", label: "Payroll" },
       { id: "assetregister", label: "Asset Register" },
       { id: "periodclose", label: "Period Close" },
+      { id: "team", label: "Team" },
     ],
     // Odoo-style segregation: the flat tab list above still drives routing
     // (moduleForView, permissions, etc.) — this just groups those same tab
@@ -81,7 +107,7 @@ const MODULES = {
       { label: "Invoices & Expenses", tabs: ["financeinvoices", "expenses"] },
       { label: "Reports", tabs: ["trialbalance", "incomestatement", "balancesheet", "cashflow", "araging", "apaging", "assetsliabilities"] },
       { label: "Payroll & Assets", tabs: ["employees", "payroll", "assetregister"] },
-      { label: "Configuration", tabs: ["periodclose"] },
+      { label: "Configuration", tabs: ["periodclose", "team"] },
     ],
   },
 };
@@ -90,6 +116,16 @@ function moduleForView(view) {
     if (MODULES[mid].tabs.some((t) => t.id === view)) return mid;
   }
   return "operations";
+}
+// Which Finance tab ids the current role may see in the subnav / route to.
+// Owner sees everything including Team; Manager sees everything except Team
+// (Owner-only, since it manages logins); Approver sees only Invoices &
+// Expenses; everyone else sees none (Finance module itself is hidden for them).
+function financeVisibleTabIds() {
+  if (isOwner()) return MODULES.finance.tabs.map((t) => t.id);
+  if (isMgmt()) return MODULES.finance.tabs.map((t) => t.id).filter((id) => id !== "team");
+  if (isApprover()) return APPROVER_FINANCE_TABS.slice();
+  return [];
 }
 const AGING_BUCKETS = ["0–30 days", "31–60 days", "61–90 days", "90+ days"];
 // Fixed display order for the Chart of Accounts' collapsible groups — matches
@@ -117,6 +153,9 @@ const state = {
   bankAccounts: [],
   expenses: [],
   employees: [],
+  team: [],           // profiles list for the Team (employee logins) screen — Owner only
+  teamBusy: false,    // true while an Edge Function call (create/deactivate/reactivate/reset) is in flight
+  teamError: "",
   payrollRuns: [],
   payrollLinesByRun: {},
   fixedAssets: [],
@@ -212,6 +251,26 @@ function isMgmt() {
 }
 function isOwner() {
   return state.profile && state.profile.role === "Owner";
+}
+function isApprover() {
+  return state.profile && state.profile.role === "Approver";
+}
+// Can write to Operations tables (customers, inquiries, quotations, work
+// orders, tasks, certificates) — Owner/Manager/Operations Staff.
+function canOpsWrite() {
+  return state.profile && OPS_WRITE_ROLES.includes(state.profile.role);
+}
+// Can see the Operations module at all — adds Viewer (read-only) on top of canOpsWrite().
+function canViewOperations() {
+  return state.profile && OPS_VIEW_ROLES.includes(state.profile.role);
+}
+// Can see the Finance module at all — Owner/Manager (everything) or Approver (Invoices & Expenses only).
+function canViewFinance() {
+  return state.profile && FINANCE_VIEW_ROLES.includes(state.profile.role);
+}
+// Can reach the Invoices/Expenses screens and their approve/reject/mark-paid actions.
+function canApproveOrManage() {
+  return isMgmt() || isApprover();
 }
 function firstOfThisMonth() {
   const d = new Date();
@@ -361,7 +420,7 @@ async function loadInvoices() {
   if (!error) state.invoices = data || [];
 }
 async function loadLedger() {
-  if (!isMgmt()) return;
+  if (!canApproveOrManage()) return;
   const [a, b] = await Promise.all([
     sb.from("account_balances").select("*").order("code"),
     sb.from("bank_balances").select("*").order("name"),
@@ -598,7 +657,7 @@ async function loadTasksFor(parentId) {
   if (!error) state.tasksByParent[parentId] = data || [];
 }
 async function loadExpenses() {
-  if (!isMgmt()) return;
+  if (!canApproveOrManage()) return;
   const { data, error } = await sb.from("expenses").select("*").order("created_at", { ascending: false }).limit(200);
   if (!error) state.expenses = data || [];
 }
@@ -606,6 +665,13 @@ async function loadEmployees() {
   if (!isMgmt()) return;
   const { data, error } = await sb.from("employees").select("*").order("created_at", { ascending: false });
   if (!error) state.employees = data || [];
+}
+// Employee LOGINS (profiles), for the Owner-only Team screen — distinct from
+// loadEmployees() above, which is the separate payroll roster (no login).
+async function loadTeam() {
+  if (!isOwner()) return;
+  const { data, error } = await sb.from("profiles").select("*").order("created_at", { ascending: true });
+  if (!error) state.team = data || [];
 }
 async function loadPayrollRuns() {
   if (!isMgmt()) return;
@@ -670,6 +736,7 @@ async function loadView(view) {
     if (view === "araging") await loadARAging();
     if (view === "apaging") await Promise.all([loadAPAging(), loadLedger()]);
     if (view === "periodclose") await loadAccountingPeriods();
+    if (view === "team") await loadTeam();
     // keep expanded rows' task lists (journal-entry lines, payroll run lines) fresh
     const openParents = Object.keys(state.expanded).filter((k) => state.expanded[k]);
     await Promise.all(openParents.map((k) => {
@@ -723,8 +790,18 @@ async function afterLogin() {
   state.profile = profile;
   if (profile && profile.active) {
     setupRealtime();
-    await loadCustomers();
-    await loadView("dashboard");
+    // Approver has no Operations access at all, so land them on Finance's
+    // Invoices & Expenses instead of the Operations dashboard, and skip the
+    // Operations-only customers preload (RLS would just return nothing for
+    // them anyway, so it'd be a wasted round trip).
+    if (isApprover()) {
+      state.module = "finance";
+      state.view = "financeinvoices";
+      await loadView("financeinvoices");
+    } else {
+      await loadCustomers();
+      await loadView("dashboard");
+    }
   }
 }
 window.App = window.App || {};
@@ -756,7 +833,16 @@ App.nav = function (view) {
 // anyone but Owner/Manager here too — belt and braces on top of the RLS
 // that already blocks every finance table for an Officer.
 App.switchModule = function (mid) {
-  if (mid === "finance" && !isMgmt()) return;
+  if (mid === "finance" && !canViewFinance()) return;
+  if (mid === "operations" && !canViewOperations()) return;
+  if (mid === "finance") {
+    // Jump to the first tab this role is actually allowed to see (Approver
+    // can't reach "financedashboard", Finance's normal first tab).
+    const visible = financeVisibleTabIds();
+    const firstTab = MODULES.finance.tabs.find((t) => visible.includes(t.id));
+    if (firstTab) App.nav(firstTab.id);
+    return;
+  }
   App.nav(MODULES[mid].tabs[0].id);
 };
 App.toggle = function (table, id) {
@@ -1104,6 +1190,80 @@ App.addEmployee = async function (ev) {
 App.toggleEmployeeActive = async function (id, active) {
   await guard(sb.from("employees").update({ active: !active }).eq("id", id));
   await loadEmployees();
+  render();
+};
+
+// ------------------------------------------------------- Team (employee logins)
+// Distinct from the payroll roster above: this manages actual sign-in
+// accounts (profiles + their Supabase Auth user), Owner-only. Creating,
+// deactivating/banning, reactivating and resetting a password all need the
+// service-role key, so they go through the manage-employee Edge Function —
+// the client never touches that key. Role changes and name edits are plain
+// profiles updates (the Owner-only branch of the existing profiles_update
+// RLS policy already allows this, no Edge Function needed for those).
+async function callManageEmployee(action, payload) {
+  const { data, error } = await sb.functions.invoke("manage-employee", { body: { action, ...payload } });
+  if (error) {
+    let msg = error.message || "Request failed";
+    try {
+      const ctx = error.context;
+      if (ctx && typeof ctx.json === "function") {
+        const body = await ctx.json();
+        if (body && body.error) msg = body.error;
+      }
+    } catch (_) { /* keep the generic message */ }
+    showToast(msg, true);
+    return null;
+  }
+  if (data && data.error) { showToast(data.error, true); return null; }
+  return data;
+}
+App.createTeamMember = async function (ev) {
+  ev.preventDefault();
+  const v = fd(ev.target);
+  if (!v.name || !v.name.trim()) { showToast("Name is required", true); return false; }
+  if (!v.email || !v.email.trim()) { showToast("Email is required", true); return false; }
+  if (!ALL_ROLES.includes(v.role)) { showToast("Pick a role", true); return false; }
+  if (!v.password || v.password.length < 8) { showToast("Temporary password must be at least 8 characters", true); return false; }
+  state.teamBusy = true; render();
+  const result = await callManageEmployee("create", { name: v.name.trim(), email: v.email.trim(), role: v.role, password: v.password });
+  state.teamBusy = false;
+  if (result) {
+    showToast(`Account created for ${v.email.trim()}`);
+    ev.target.reset();
+    await loadTeam();
+  }
+  render();
+  return false;
+};
+App.changeTeamMemberRole = async function (id, role) {
+  await guard(sb.from("profiles").update({ role }).eq("id", id), "Role updated");
+  await loadTeam();
+  render();
+};
+App.deactivateTeamMember = async function (id, name) {
+  if (!confirm(`Deactivate ${name}? They'll be signed out and unable to sign back in until reactivated.`)) return;
+  state.teamBusy = true; render();
+  const result = await callManageEmployee("deactivate", { user_id: id });
+  state.teamBusy = false;
+  if (result) { showToast(`${name} deactivated`); await loadTeam(); }
+  render();
+};
+App.reactivateTeamMember = async function (id, name) {
+  state.teamBusy = true; render();
+  const result = await callManageEmployee("reactivate", { user_id: id });
+  state.teamBusy = false;
+  if (result) { showToast(`${name} reactivated`); await loadTeam(); }
+  render();
+};
+App.resetTeamMemberPassword = async function (id, name) {
+  const password = prompt(`New temporary password for ${name} (at least 8 characters):`);
+  if (!password) return;
+  if (password.length < 8) { showToast("Password must be at least 8 characters", true); return; }
+  state.teamBusy = true; render();
+  const result = await callManageEmployee("reset_password", { user_id: id, password });
+  state.teamBusy = false;
+  if (result) showToast(`Password reset for ${name}`);
   render();
 };
 
@@ -1685,21 +1845,29 @@ function renderDisabled() {
 }
 function renderShell() {
   const mod = state.module;
-  const showFinance = isMgmt();
+  const showOperations = canViewOperations();
+  const showFinance = canViewFinance();
   const moduleBtns = `
-    <button class="mod-operations ${mod === "operations" ? "active" : ""}" onclick="App.switchModule('operations')">Operations</button>
+    ${showOperations ? `<button class="mod-operations ${mod === "operations" ? "active" : ""}" onclick="App.switchModule('operations')">Operations</button>` : ""}
     ${showFinance ? `<button class="mod-finance ${mod === "finance" ? "active" : ""}" onclick="App.switchModule('finance')">Finance</button>` : ""}`;
   const modDef = MODULES[mod] || MODULES.operations;
   // Modules with a `groups` array (currently just Finance) get a two-tier
   // subnav — a row of section labels, then that section's own tabs — so a
   // long flat list of screens reads as organized areas instead of one row.
   // Modules without one (Operations) keep the original single-row subnav.
+  // Finance additionally filters both tiers down to whatever this role may
+  // actually reach (financeVisibleTabIds()) — e.g. an Approver only ever
+  // sees the "Invoices & Expenses" group, and only Owner sees "Team".
   let subnavHtml;
   if (modDef.groups) {
+    const visibleIds = mod === "finance" ? financeVisibleTabIds() : modDef.tabs.map((t) => t.id);
     const tabById = {};
     modDef.tabs.forEach((t) => { tabById[t.id] = t; });
-    const activeGroup = modDef.groups.find((g) => g.tabs.includes(state.view)) || modDef.groups[0];
-    const groupBtns = modDef.groups.map((g) =>
+    const visibleGroups = modDef.groups
+      .map((g) => ({ ...g, tabs: g.tabs.filter((id) => visibleIds.includes(id)) }))
+      .filter((g) => g.tabs.length);
+    const activeGroup = visibleGroups.find((g) => g.tabs.includes(state.view)) || visibleGroups[0] || { tabs: [] };
+    const groupBtns = visibleGroups.map((g) =>
       `<button class="${g === activeGroup ? "active" : ""}" onclick="App.nav('${g.tabs[0]}')">${esc(g.label)}</button>`
     ).join("");
     const itemBtns = activeGroup.tabs.map((id) =>
@@ -1734,8 +1902,9 @@ function renderView() {
     case "quotations": return renderQuotations();
     case "workorders": return renderWorkOrders();
     case "invoices": return renderInvoices();
-    case "financeinvoices": return isMgmt() ? renderInvoices() : mgmtOnlyView();
-    case "expenses": return isMgmt() ? renderExpenses() : mgmtOnlyView();
+    case "financeinvoices": return canApproveOrManage() ? renderInvoices() : mgmtOnlyView();
+    case "expenses": return canApproveOrManage() ? renderExpenses() : mgmtOnlyView();
+    case "team": return isOwner() ? renderTeam() : mgmtOnlyView();
     case "employees": return isMgmt() ? renderEmployees() : mgmtOnlyView();
     case "payroll": return isMgmt() ? renderPayroll() : mgmtOnlyView();
     case "assetregister": return isMgmt() ? renderFixedAssets() : mgmtOnlyView();
@@ -1809,7 +1978,7 @@ function renderCustomers() {
             <td>${esc(c.contact)}</td>
             <td>${esc(c.city)}</td>
             <td>${esc(c.vat_reg_no)}</td>
-            <td onclick="event.stopPropagation()"><button class="link-btn" onclick="App.toggle('customers','${c.id}')">${open ? "close" : "edit"}</button></td>
+            <td onclick="event.stopPropagation()"><button class="link-btn" onclick="App.toggle('customers','${c.id}')">${open ? "close" : (canOpsWrite() ? "edit" : "view")}</button></td>
           </tr>
           ${open ? `<tr><td colspan="7">${renderCustomerEditor(c)}</td></tr>` : ""}`;
         }).join("") : `<tr><td colspan="7" class="empty-state">No customers yet.</td></tr>`}
@@ -1819,32 +1988,34 @@ function renderCustomers() {
 }
 
 function renderCustomerEditor(c) {
+  const ro = !canOpsWrite();
+  const dis = ro ? "disabled" : "";
   return `
   <div class="wo-detail">
     <form onsubmit="return App.updateCustomer('${c.id}',event)">
       <div class="form-row">
-        <div class="field"><label>Customer name</label><input name="display_name" value="${esc(c.display_name)}" required></div>
-        <div class="field"><label>Invoice name</label><input name="invoice_name" value="${esc(c.invoice_name)}"></div>
-        <div class="field"><label>Contact</label><input name="contact" value="${esc(c.contact)}"></div>
-        <div class="field"><label>Company name</label><input name="company_name" value="${esc(c.company_name)}"></div>
+        <div class="field"><label>Customer name</label><input name="display_name" value="${esc(c.display_name)}" required ${dis}></div>
+        <div class="field"><label>Invoice name</label><input name="invoice_name" value="${esc(c.invoice_name)}" ${dis}></div>
+        <div class="field"><label>Contact</label><input name="contact" value="${esc(c.contact)}" ${dis}></div>
+        <div class="field"><label>Company name</label><input name="company_name" value="${esc(c.company_name)}" ${dis}></div>
       </div>
       <div class="form-row" style="margin-top:10px">
-        <div class="field"><label>Email</label><input name="email" type="email" value="${esc(c.email)}"></div>
-        <div class="field"><label>Phone</label><input name="phone" value="${esc(c.phone)}"></div>
-        <div class="field"><label>Mobile</label><input name="mobile" value="${esc(c.mobile)}"></div>
-        <div class="field"><label>VAT registration no.</label><input name="vat_reg_no" value="${esc(c.vat_reg_no)}"></div>
+        <div class="field"><label>Email</label><input name="email" type="email" value="${esc(c.email)}" ${dis}></div>
+        <div class="field"><label>Phone</label><input name="phone" value="${esc(c.phone)}" ${dis}></div>
+        <div class="field"><label>Mobile</label><input name="mobile" value="${esc(c.mobile)}" ${dis}></div>
+        <div class="field"><label>VAT registration no.</label><input name="vat_reg_no" value="${esc(c.vat_reg_no)}" ${dis}></div>
       </div>
       <div class="form-row" style="margin-top:10px">
-        <div class="field"><label>Building no.</label><input name="building_no" value="${esc(c.building_no)}"></div>
-        <div class="field"><label>Street</label><input name="street" value="${esc(c.street)}"></div>
-        <div class="field"><label>District</label><input name="district" value="${esc(c.district)}"></div>
-        <div class="field"><label>Postal code</label><input name="postal_code" value="${esc(c.postal_code)}"></div>
+        <div class="field"><label>Building no.</label><input name="building_no" value="${esc(c.building_no)}" ${dis}></div>
+        <div class="field"><label>Street</label><input name="street" value="${esc(c.street)}" ${dis}></div>
+        <div class="field"><label>District</label><input name="district" value="${esc(c.district)}" ${dis}></div>
+        <div class="field"><label>Postal code</label><input name="postal_code" value="${esc(c.postal_code)}" ${dis}></div>
       </div>
       <div class="form-row" style="margin-top:10px">
-        <div class="field"><label>City</label><input name="city" value="${esc(c.city)}"></div>
-        <div class="field"><label>State / Province</label><input name="state" value="${esc(c.state)}"></div>
-        <div class="field"><label>Country</label><input name="country" value="${esc(c.country) || "Saudi Arabia"}"></div>
-        <div class="field" style="flex:0"><label>&nbsp;</label><button class="btn btn-primary" type="submit">Save</button></div>
+        <div class="field"><label>City</label><input name="city" value="${esc(c.city)}" ${dis}></div>
+        <div class="field"><label>State / Province</label><input name="state" value="${esc(c.state)}" ${dis}></div>
+        <div class="field"><label>Country</label><input name="country" value="${esc(c.country) || "Saudi Arabia"}" ${dis}></div>
+        ${ro ? "" : `<div class="field" style="flex:0"><label>&nbsp;</label><button class="btn btn-primary" type="submit">Save</button></div>`}
       </div>
     </form>
   </div>`;
@@ -1870,13 +2041,15 @@ function renderTasksEditor(parentType, parentId, discount, accountingSystem, sho
   // (parentType "Inquiry"/"Quotation"), where adding or removing items
   // stays open, since those are still being drafted.
   const itemsLocked = parentType === "Work Order";
+  const canWrite = canOpsWrite();
+  const showRemoveCol = !itemsLocked && canWrite;
   return `
   <div class="wo-detail">
     <table>
-      <thead><tr><th>Service</th><th>Description</th><th class="right">Price (SAR)</th><th class="right">Discount (SAR)</th>${showStatus ? "<th>Status</th>" : ""}${itemsLocked ? "" : "<th></th>"}</tr></thead>
+      <thead><tr><th>Service</th><th>Description</th><th class="right">Price (SAR)</th><th class="right">Discount (SAR)</th>${showStatus ? "<th>Status</th>" : ""}${showRemoveCol ? "<th></th>" : ""}</tr></thead>
       <tbody>
         ${tasks.length ? tasks.map((tk) => {
-          const statusLocked = showStatus && tk.status === "Delivered";
+          const statusLocked = showStatus && (tk.status === "Delivered" || !canWrite);
           return `
           <tr>
             <td>${esc(tk.service_type) || "—"}</td>
@@ -1885,19 +2058,19 @@ function renderTasksEditor(parentType, parentId, discount, accountingSystem, sho
             <td class="right">${fmtMoney(tk.discount)}</td>
             ${showStatus ? `<td>
               ${statusLocked
-                ? `${statusPill(tk.status)}<div class="subtle">locked — final</div>`
+                ? `${statusPill(tk.status)}${tk.status === "Delivered" ? `<div class="subtle">locked — final</div>` : ""}`
                 : `<select onchange="App.updateTaskStatus('${tk.id}','${parentId}',this.value)">
                     ${["In Process", "Completed", "Delivered"].map((s) => `<option value="${s}" ${s === tk.status ? "selected" : ""}>${s}</option>`).join("")}
                   </select>`}
             </td>` : ""}
-            ${itemsLocked ? "" : `<td><button class="link-btn" onclick="App.deleteTask('${tk.id}','${parentId}')">remove</button></td>`}
+            ${showRemoveCol ? `<td><button class="link-btn" onclick="App.deleteTask('${tk.id}','${parentId}')">remove</button></td>` : ""}
           </tr>`;
         }).join("") : `<tr><td colspan="${showStatus ? 6 : 5}" class="empty-state">No line items yet.</td></tr>`}
       </tbody>
     </table>
     ${itemsLocked
       ? `<p class="subtle" style="margin-top:10px">Line items are fixed once a work order is created — they came from the inquiry or quotation it was converted from and can't be added to or removed by anyone.</p>`
-      : `<form class="form-row" style="margin-top:10px" onsubmit="return App.addTask('${parentType}','${parentId}',event)">
+      : (canWrite ? `<form class="form-row" style="margin-top:10px" onsubmit="return App.addTask('${parentType}','${parentId}',event)">
       <div class="field"><label>Service</label>
         <select name="service_type" required>
           <option value="">— pick —</option>
@@ -1908,7 +2081,7 @@ function renderTasksEditor(parentType, parentId, discount, accountingSystem, sho
       <div class="field"><label>Price (SAR)</label><input name="price" type="number" step="0.01" min="0" required></div>
       <div class="field"><label>Discount (SAR)</label><input name="discount" type="number" step="0.01" min="0" value="0"></div>
       <div class="field" style="flex:0"><label>&nbsp;</label><button class="btn btn-ghost btn-sm" type="submit">Add item</button></div>
-    </form>`}
+    </form>` : "")}
     <div class="totals-line">
       Items subtotal (after item discounts): <b>${fmtMoney(t.subtotal)}</b> &nbsp; Order discount: <b>${fmtMoney(discount)}</b> &nbsp;
       VAT (${t.rate > 0 ? "15%" : "—"}): <b>${fmtMoney(t.tax)}</b> &nbsp; Total: <b>${fmtMoney(t.total)}</b>
@@ -1969,9 +2142,11 @@ function renderInquiries() {
   const d = state.inquiryDraft;
   const pickedCustomer = d.customer_id ? state.customers.find((c) => c.id === d.customer_id) : null;
   const draftTotals = taskTotals(d.items, d.discount, d.accounting_system);
+  const canWrite = canOpsWrite();
   return `
   <h2 class="page-title">Inquiries</h2>
   <p class="page-sub">Capture the customer and every service they're asking about in one go, then convert it to a quotation or straight to a work order.</p>
+  ${canWrite ? `
   <div class="card">
     <h3>New inquiry</h3>
     <form onsubmit="return App.addInquiry(event)">
@@ -2019,7 +2194,7 @@ function renderInquiries() {
       <div class="totals-line" id="inquiryDraftTotals">Items subtotal (after item discounts): <b>${fmtMoney(draftTotals.subtotal)}</b> &nbsp; Order discount: <b>${fmtMoney(d.discount)}</b> &nbsp;
         VAT (${draftTotals.rate > 0 ? "15%" : "—"}): <b>${fmtMoney(draftTotals.tax)}</b> &nbsp; Total: <b>${fmtMoney(draftTotals.total)}</b></div>
     </form>
-  </div>
+  </div>` : ""}
   <div class="card">
     <table>
       <thead><tr><th>No.</th><th>Customer</th><th>Date</th><th>System</th><th>Result</th><th></th></tr></thead>
@@ -2028,7 +2203,7 @@ function renderInquiries() {
           const key = "inquiries:" + q.id;
           const open = !!state.expanded[key];
           const resultLabel = q.wo_number ? `WO ${q.wo_number}` : q.quote_number ? `Quote ${q.quote_number}` : pill("Open", "pending");
-          const canConvert = !q.wo_id && !q.quote_id;
+          const canConvert = !q.wo_id && !q.quote_id && canWrite;
           return `
           <tr class="clickable" onclick="App.toggle('inquiries','${q.id}')">
             <td>${esc(q.inquiry_number)}</td><td>${esc(q.customer)}</td><td>${fmtDate(q.inquiry_date)}</td>
@@ -2062,7 +2237,7 @@ function renderQuotations() {
           <tr class="clickable" onclick="App.toggle('quotations','${q.id}')">
             <td>${esc(q.quote_number)}</td><td>${esc(q.customer)}</td><td>${fmtDate(q.quote_date)}</td>
             <td>${statusPillForQuote(q.status)}${q.wo_number ? ` → WO ${esc(q.wo_number)}` : ""}</td>
-            <td onclick="event.stopPropagation()">${q.status === "Pending" ? `
+            <td onclick="event.stopPropagation()">${q.status === "Pending" && canOpsWrite() ? `
               <button class="btn btn-ghost btn-sm" onclick="App.acceptQuotation('${q.id}')">Accept</button>
               <button class="btn btn-ghost btn-sm" onclick="App.rejectQuotation('${q.id}')">Reject</button>` : ""}
             </td>
@@ -2096,7 +2271,7 @@ function renderWorkOrders() {
             <td>${esc(w.wo_number)}</td><td>${esc(w.customer)}</td><td>${fmtDate(w.wo_date)}</td>
             <td>${w.cancelled ? pill("Cancelled", "cancelled") : statusPill(w.status)}</td>
             <td>${inv ? esc(inv.invoice_number) + " " + pill(inv.payment_status, inv.payment_status === "Paid" ? "paid" : "unpaid") : "—"}</td>
-            <td onclick="event.stopPropagation()">${!w.cancelled ? `<button class="btn btn-ghost btn-sm" onclick="App.cancelWorkOrder('${w.id}')">Cancel</button>` : ""}</td>
+            <td onclick="event.stopPropagation()">${!w.cancelled && canOpsWrite() ? `<button class="btn btn-ghost btn-sm" onclick="App.cancelWorkOrder('${w.id}')">Cancel</button>` : ""}</td>
           </tr>
           ${open ? `<tr><td colspan="6">${renderTasksEditor("Work Order", w.id, w.discount, w.accounting_system, true)}</td></tr>` : ""}`;
         }).join("") : `<tr><td colspan="6" class="empty-state">No work orders yet.</td></tr>`}
@@ -2113,7 +2288,7 @@ function renderInvoices() {
   <p class="page-sub">Invoices appear here automatically once a work order is fully delivered.</p>
   <div class="card">
     <table>
-      <thead><tr><th>No.</th><th>Work order</th><th>Customer</th><th>Date</th><th class="right">Total (SAR)</th><th>Status</th>${isMgmt() ? "<th>Mark paid</th>" : ""}</tr></thead>
+      <thead><tr><th>No.</th><th>Work order</th><th>Customer</th><th>Date</th><th class="right">Total (SAR)</th><th>Status</th>${canApproveOrManage() ? "<th>Mark paid</th>" : ""}</tr></thead>
       <tbody>
         ${state.invoices.length ? state.invoices.map((inv) => {
           const wo = state.workOrders.find((w) => w.id === inv.wo_id);
@@ -2125,13 +2300,13 @@ function renderInvoices() {
             <td>${fmtDate(inv.invoice_date)}</td>
             <td class="right">${total !== null ? fmtMoney(total) : `<button class="link-btn" onclick="App.toggle('workorders','${wo ? wo.id : ""}');App.nav('workorders')">view on work order</button>`}</td>
             <td>${pill(inv.payment_status, inv.payment_status === "Paid" ? "paid" : "unpaid")}${inv.paid_at ? `<div class="subtle">${fmtDateTime(inv.paid_at)}</div>` : ""}</td>
-            ${isMgmt() ? `<td>${inv.payment_status === "Unpaid" ? `
+            ${canApproveOrManage() ? `<td>${inv.payment_status === "Unpaid" ? `
               <select onchange="App.markInvoicePaid('${inv.id}',event)">
                 <option value="">Pick bank…</option>
                 ${state.bankAccounts.map((b) => `<option value="${b.id}">${esc(b.name)}</option>`).join("")}
               </select>` : (inv.paid_from ? esc((state.bankAccounts.find((b) => b.id === inv.paid_from) || {}).name || "") : "")}</td>` : ""}
           </tr>`;
-        }).join("") : `<tr><td colspan="${isMgmt() ? 7 : 6}" class="empty-state">No invoices yet.</td></tr>`}
+        }).join("") : `<tr><td colspan="${canApproveOrManage() ? 7 : 6}" class="empty-state">No invoices yet.</td></tr>`}
       </tbody>
     </table>
   </div>`;
@@ -2155,6 +2330,7 @@ function renderExpenses() {
     <div class="kpi"><div class="label">Awaiting payment</div><div class="value">${fmtMoney(awaitingPayment)}</div></div>
     <div class="kpi"><div class="label">Paid this month</div><div class="value">${fmtMoney(paidThisMonth)}</div></div>
   </div>
+  ${isApprover() ? "" : `
   <div class="card">
     <h3>New expense</h3>
     <form onsubmit="return App.addExpense(event)">
@@ -2169,7 +2345,7 @@ function renderExpenses() {
         <div class="field" style="flex:0"><label>&nbsp;</label><button class="btn btn-primary" type="submit">Add</button></div>
       </div>
     </form>
-  </div>
+  </div>`}
   <div class="card">
     <div class="form-row" style="margin-bottom:12px"><div class="field" style="flex:0"><button class="btn btn-ghost btn-sm" onclick="App.exportExpenses()">Export to Excel</button></div></div>
     <table>
@@ -2226,6 +2402,68 @@ function renderEmployees() {
             <td>${e.active ? pill("Active", "delivered") : pill("Inactive", "cancelled")}</td>
             <td><button class="link-btn" onclick="App.toggleEmployeeActive('${e.id}',${e.active})">${e.active ? "deactivate" : "reactivate"}</button></td>
           </tr>`).join("") : `<tr><td colspan="5" class="empty-state">No employees yet.</td></tr>`}
+      </tbody>
+    </table>
+  </div>`;
+}
+
+// ------------------------------------------------------- Team (employee logins)
+
+function roleOptions(selected) {
+  return ALL_ROLES.map((r) => `<option value="${esc(r)}" ${r === selected ? "selected" : ""}>${esc(r)}</option>`).join("");
+}
+function roleHelpText(role) {
+  return {
+    Owner: "Full access to everything, including managing the team.",
+    Manager: "Full access to Operations and Finance — everything but managing the team.",
+    "Operations Staff": "Full Operations access (customers through invoices). No Finance access at all.",
+    Approver: "Finance access limited to Invoices & Expenses — mark invoices paid, approve/reject/pay expenses. No Payroll, Journal Entries, Reports, Chart of Accounts or Employees.",
+    Viewer: "Read-only access to Operations (customers through invoices). No Finance access at all.",
+  }[role] || "";
+}
+function renderTeam() {
+  const me = state.session.user.id;
+  return `
+  <h2 class="page-title">Team</h2>
+  <p class="page-sub">Employee logins — separate from the Employees payroll roster. Each person's role decides what they can see and do; changing it here takes effect immediately. Deactivating someone signs them out and blocks sign-in until they're reactivated.</p>
+  <div class="card">
+    <h3>Add an employee login</h3>
+    <form onsubmit="return App.createTeamMember(event)">
+      <div class="form-row">
+        <div class="field"><label>Name *</label><input name="name" required></div>
+        <div class="field"><label>Email *</label><input name="email" type="email" required></div>
+        <div class="field"><label>Role *</label><select name="role" required>
+          <option value="">— pick —</option>
+          ${roleOptions("")}
+        </select></div>
+        <div class="field"><label>Temporary password *</label><input name="password" type="text" required minlength="8" placeholder="At least 8 characters"></div>
+        <div class="field" style="flex:0"><label>&nbsp;</label><button class="btn btn-primary" type="submit" ${state.teamBusy ? "disabled" : ""}>${state.teamBusy ? "Creating…" : "Create login"}</button></div>
+      </div>
+      <p class="subtle" style="margin-top:6px">Share this temporary password with them directly — they can sign in with it right away. There's no reset-your-own-password email flow yet, so use "reset password" below if they lose it.</p>
+    </form>
+  </div>
+  <div class="card">
+    <table>
+      <thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Status</th><th></th></tr></thead>
+      <tbody>
+        ${state.team.length ? state.team.map((p) => `
+          <tr>
+            <td>${esc(p.name)}${p.id === me ? ` <span class="subtle">(you)</span>` : ""}</td>
+            <td>${esc(p.email) || "—"}</td>
+            <td>
+              <select ${p.id === me ? "disabled title=\"You can't change your own role\"" : ""} onchange="App.changeTeamMemberRole('${p.id}',this.value)">
+                ${roleOptions(p.role)}
+              </select>
+              <div class="subtle" style="max-width:260px">${esc(roleHelpText(p.role))}</div>
+            </td>
+            <td>${p.active ? pill("Active", "delivered") : pill("Deactivated", "cancelled")}</td>
+            <td>
+              <button class="link-btn" onclick="App.resetTeamMemberPassword('${p.id}','${esc(p.name).replace(/'/g, "\\'")}')" ${state.teamBusy ? "disabled" : ""}>reset password</button>
+              ${p.id === me ? "" : (p.active
+                ? `<button class="link-btn" onclick="App.deactivateTeamMember('${p.id}','${esc(p.name).replace(/'/g, "\\'")}')" ${state.teamBusy ? "disabled" : ""}>deactivate</button>`
+                : `<button class="link-btn" onclick="App.reactivateTeamMember('${p.id}','${esc(p.name).replace(/'/g, "\\'")}')" ${state.teamBusy ? "disabled" : ""}>reactivate</button>`)}
+            </td>
+          </tr>`).join("") : `<tr><td colspan="5" class="empty-state">Loading team…</td></tr>`}
       </tbody>
     </table>
   </div>`;
